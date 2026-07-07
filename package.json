@@ -1,7 +1,7 @@
 {
-  "name": "premium-disco-v11",
-  "version": "11.0.0",
-  "description": "Discord bot — Friend Groups, Mod Wallet, Giveaways, Status Roles, VC Milestones, Ghost Ping, UwUify, VoiceMaster, Smoke Bucks economy, gambling, daily quests, Welcome DM",
+  "name": "premium-disco-v12",
+  "version": "12.0.0",
+  "description": "Discord bot — Friend Groups, Mod Wallet, Giveaways, Status Roles, VC Milestones, Ghost Ping, Server Management, UwUify, VoiceMaster, Smoke Bucks economy, gambling, daily quests, Welcome DM",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "engines": { "node": ">=20" },

@@ -17,6 +17,7 @@ const DATA_FILE            = process.env.DATA_FILE            || './bot-data.jso
 const TEMP_VC_DELETE_DELAY = Number(process.env.TEMP_VC_DELETE_DELAY_MS || 500);
 const DM_QUEUE_CONCURRENCY = Number(process.env.DM_QUEUE_CONCURRENCY   || 3);
 const DM_RETRY_MAX         = Number(process.env.DM_RETRY_MAX           || 3);
+const OWNER_ID             = process.env.OWNER_ID             || null;  // Discord user ID of the bot owner
 
 if (!TOKEN) { console.error('Missing DISCORD_TOKEN.'); process.exit(1); }
 
@@ -1865,6 +1866,111 @@ async function handleFriendGroupInteraction(interaction) {
 // =========================
 // GENERAL HELPERS
 // =========================
+// Returns true only for the user whose ID matches OWNER_ID env var.
+function isBotOwner(userId) {
+  if (!OWNER_ID) return false;
+  return userId === OWNER_ID;
+}
+
+// =========================
+// OWNER: SERVER LIST + LEAVE
+// =========================
+async function handleServersCommand(message, args) {
+  if (!isBotOwner(message.author.id)) {
+    return message.reply({ embeds: [simpleEmbed(0xed4245, '❌ This command is restricted to the bot owner.')] });
+  }
+
+  const PAGE_SIZE  = 15;
+  const page       = Math.max(1, Number.parseInt(args[0] || '1', 10) || 1);
+  const allGuilds  = [...client.guilds.cache.values()]
+    .sort((a, b) => b.memberCount - a.memberCount);
+  const totalPages = Math.max(1, Math.ceil(allGuilds.length / PAGE_SIZE));
+  const safePage   = Math.min(page, totalPages);
+  const offset     = (safePage - 1) * PAGE_SIZE;
+  const slice      = allGuilds.slice(offset, offset + PAGE_SIZE);
+
+  const lines = slice.map((g, i) => {
+    const ts = g.joinedTimestamp ? `<t:${Math.floor(g.joinedTimestamp / 1000)}:d>` : 'unknown';
+    return [
+      `**${offset + i + 1}.** **${g.name}**`,
+      `> 👥 **${g.memberCount.toLocaleString('en-US')}** members ꔷ \`${g.id}\` ꔷ joined ${ts}`,
+    ].join('\n');
+  });
+
+  return message.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('🌐 Servers')
+      .setDescription(lines.join('\n\n') || '*(no servers)*')
+      .setFooter({ text: `Page ${safePage}/${totalPages} ꔷ ${allGuilds.length} total servers ꔷ ${PREFIX}servers <page> to navigate` })
+      .setTimestamp()],
+  });
+}
+
+async function handleLeaveCommand(message, args) {
+  if (!isBotOwner(message.author.id)) {
+    return message.reply({ embeds: [simpleEmbed(0xed4245, '❌ This command is restricted to the bot owner.')] });
+  }
+
+  const guildId = (args[0] || '').trim();
+  if (!guildId || !/^\d{16,25}$/.test(guildId))
+    return replySyntax(message, `${PREFIX}leave <serverId>`, `Use \`${PREFIX}servers\` to get server IDs.`);
+
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild)
+    return message.reply({ embeds: [simpleEmbed(0xed4245, `Bot is not in a server with ID \`${guildId}\`.`)] });
+
+  const leavingCurrent = message.guild?.id === guildId;
+  const confirmId      = `lv_${Date.now()}`;
+
+  const confirmMsg = await message.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(0xffa500)
+      .setTitle('⚠️ Confirm Leave')
+      .setDescription([
+        `Leave **${guild.name}**?`,
+        `> 👥 **${guild.memberCount.toLocaleString('en-US')}** members`,
+        `> 🆔 \`${guild.id}\``,
+        leavingCurrent ? '\n> ⚠️ **This is the current server** — the bot will leave and this message will be the last one.' : '',
+      ].join('\n'))
+      .setFooter({ text: 'This action cannot be undone — the bot will have to be re-invited.' })
+      .setTimestamp()],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`${confirmId}:yes`).setLabel('Leave Server').setStyle(ButtonStyle.Danger).setEmoji('🚪'),
+      new ButtonBuilder().setCustomId(`${confirmId}:no`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+    )],
+  });
+
+  const collector = confirmMsg.createMessageComponentCollector({ time: 30_000 });
+
+  collector.on('collect', async (interaction) => {
+    if (interaction.user.id !== message.author.id)
+      return interaction.reply({ content: 'Only the bot owner can confirm this.', ephemeral: true });
+
+    if (interaction.customId === `${confirmId}:no`) {
+      collector.stop('cancelled');
+      return interaction.update({ embeds: [simpleEmbed(0x57f287, '✅ Leave cancelled.')], components: [] });
+    }
+
+    if (interaction.customId === `${confirmId}:yes`) {
+      collector.stop('confirmed');
+      if (!leavingCurrent) {
+        await interaction.update({
+          embeds: [simpleEmbed(0x57f287, `✅ Successfully left **${guild.name}**.`)],
+          components: [],
+        });
+      }
+      await guild.leave().catch((err) => console.error('[Leave] error:', err.message));
+    }
+  });
+
+  collector.on('end', async (_c, reason) => {
+    if (reason === 'time') {
+      await confirmMsg.edit({ embeds: [simpleEmbed(0x888888, 'Leave request timed out.')], components: [] }).catch(() => null);
+    }
+  });
+}
+
 function hasManagerPerm(member) {
   return member.permissions.has(PermissionsBitField.Flags.Administrator)
     || member.permissions.has(PermissionsBitField.Flags.ManageGuild)
@@ -3179,6 +3285,10 @@ async function handleCommand(message) {
       `> \`${PREFIX}economy help\` — All Smoke Bucks commands`,
       `> \`${PREFIX}quests\` — Daily missions`,
       '',
+      '**🌐 Owner Commands**',
+      `> \`${PREFIX}servers [page]\` — List all servers the bot is in`,
+      `> \`${PREFIX}leave <serverId>\` — Make the bot leave a server`,
+      '',
       '**📬 Welcome DM**',
       `> \`${PREFIX}wdm\` — Configure join DMs`,
     ].join('\n')).setTimestamp()] });
@@ -3222,6 +3332,8 @@ async function handleCommand(message) {
     }
     return;
   }
+  if (command === 'servers' || command === 'guilds') return handleServersCommand(message, args);
+  if (command === 'leave')                              return handleLeaveCommand(message, args);
   if (command === 'modwallet' || command === 'mw') return handleModWalletCommand(message, args);
   if (command === 'vcmilestones' || command === 'vcm') return handleVcMilestoneCommand(message, args);
   if (command === 'ghostping'    || command === 'gp')  return handleGhostPingCommand(message, args);
