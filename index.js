@@ -1895,6 +1895,7 @@ async function handleFriendGroupInteraction(interaction) {
 const FG_APP_COOLDOWN_MS     = 12 * 60 * 60 * 1000; // 12h between applications per user
 const FG_TICKET_TIMEOUT_MS   = 30 * 60 * 1000;       // ticket auto-closes after 30min inactivity
 const FG_MIN_MEMBERS         = 5;                      // minimum members required
+const FG_MAX_MEMBERS         = 10;                     // maximum members allowed
 const FG_WARNING_DURATION_MS = 24 * 60 * 60 * 1000;  // 24h to fix member count
 
 // In-memory only — not persisted (NodeJS timer handles)
@@ -1948,11 +1949,11 @@ function buildFgStepEmbed(step, extras = {}) {
       .setDescription('Who is the **owner** of this friend group?\n\n**Mention** them below. (e.g. `@username`)\n\n> The owner manages the group and receives a special role.');
     case 'count': return b()
       .setTitle('👥 Step 2 / 6 — Member Count')
-      .setDescription(`How many members are in your friend group?\n\n> ⚠️ **Minimum of ${FG_MIN_MEMBERS} members required.**\n\nReply with a number.`);
+      .setDescription(`How many members are in your friend group?\n\n> Must be between **${FG_MIN_MEMBERS} and ${FG_MAX_MEMBERS} members**.\n\nReply with a plain number (e.g. \`7\`)`);
     case 'members': return b()
       .setTitle('🔖 Step 3 / 6 — Tag Your Members')
       .setDescription(`Please **mention all ${extras.count || FG_MIN_MEMBERS} members** in a single message.\n\nExample: \`@user1 @user2 @user3 @user4 @user5\``)
-      .setFooter({ text: `At least ${FG_MIN_MEMBERS} member mentions required.` });
+      .setFooter({ text: `Between ${FG_MIN_MEMBERS} and ${FG_MAX_MEMBERS} member mentions required.` });
     case 'active': return b()
       .setTitle('✅ Step 4 / 6 — Activity Status')
       .setDescription('Is your friend group currently **active**?\n\nReply with **yes** or **no**.');
@@ -2021,12 +2022,13 @@ async function submitFgApplication(guild, ticket) {
 
   const appId = generateFgId();
   const msg   = await reviewCh.send({
+    content:    '@everyone',
     embeds:     [buildFgReviewEmbed(ticket.answers, ticket.applicantId)],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`fg_approve:${appId}`).setLabel('Approve').setStyle(ButtonStyle.Success).setEmoji('✅'),
       new ButtonBuilder().setCustomId(`fg_deny:${appId}`).setLabel('Deny').setStyle(ButtonStyle.Danger).setEmoji('❌'),
     )],
-    allowedMentions: { parse: [] },
+    allowedMentions: { parse: ['everyone'] },
   }).catch(err => { console.error('[FG] review send error:', err.message); return null; });
 
   if (!msg) return false;
@@ -2072,14 +2074,21 @@ async function handleFgTicketMessage(message) {
 
   // ── count ──
   if (step === 'count') {
-    const n = Number.parseInt(content, 10);
-    if (!Number.isFinite(n) || n < 1) { await message.reply({ embeds: [simpleEmbed(0xed4245, '❌ Please enter a valid number.')] }); return; }
+    // Strip any accidental mentions/extra text and parse the first token as a number
+    const raw = content.replace(/<[^>]+>/g, '').trim().split(/\s+/)[0];
+    const n   = Number.parseInt(raw, 10);
+    if (!Number.isFinite(n) || n < 1 || n > 9999) {
+      await message.reply({ embeds: [simpleEmbed(0xed4245, `❌ Please enter a plain number between **${FG_MIN_MEMBERS}** and **${FG_MAX_MEMBERS}** (e.g. \`7\`).`)] }); return;
+    }
     if (n < FG_MIN_MEMBERS) {
       await message.channel.send({ embeds: [new EmbedBuilder().setColor(0xed4245)
         .setTitle('❌ Not Enough Members')
-        .setDescription(`Friend groups need at least **${FG_MIN_MEMBERS} members**.\n\nYou entered **${n}**. Please reapply once you have enough members.\n\n> ⏰ This ticket closes in **30 seconds**.`)
+        .setDescription(`Friend groups need at least **${FG_MIN_MEMBERS} members**.\n\nYou entered **${n}**. Please reapply once you have enough.\n\n> ⏰ This ticket closes in **30 seconds**.`)
         .setTimestamp()] });
       closeFgTicket(message.guild, message.channel.id, 30_000); return;
+    }
+    if (n > FG_MAX_MEMBERS) {
+      await message.reply({ embeds: [simpleEmbed(0xed4245, `❌ Friend groups can have a maximum of **${FG_MAX_MEMBERS} members**. You entered **${n}** — please enter a number between ${FG_MIN_MEMBERS} and ${FG_MAX_MEMBERS}.`)] }); return;
     }
     ticket.answers.memberCount = n; ticket.step = 'members'; saveDb();
     await message.channel.send({ embeds: [buildFgStepEmbed('members', { count: n })] }); return;
@@ -2087,11 +2096,14 @@ async function handleFgTicketMessage(message) {
 
   // ── members ──
   if (step === 'members') {
-    const users = [...message.mentions.users.values()].filter(u => !u.bot);
+    const users = [...new Set(message.mentions.users.values())].filter(u => !u.bot);
     if (users.length < FG_MIN_MEMBERS) {
-      await message.reply({ embeds: [simpleEmbed(0xed4245, `❌ Need at least **${FG_MIN_MEMBERS}** member mentions — you mentioned **${users.length}**. Try again.`)] }); return;
+      await message.reply({ embeds: [simpleEmbed(0xed4245, `❌ Please mention at least **${FG_MIN_MEMBERS}** members — you mentioned **${users.length}**. Try again.`)] }); return;
     }
-    ticket.answers.memberIds = [...new Set(users.map(u => u.id))]; ticket.step = 'active'; saveDb();
+    if (users.length > FG_MAX_MEMBERS) {
+      await message.reply({ embeds: [simpleEmbed(0xed4245, `❌ Friend groups can have a maximum of **${FG_MAX_MEMBERS}** members — you mentioned **${users.length}**. Please mention up to ${FG_MAX_MEMBERS} members and try again.`)] }); return;
+    }
+    ticket.answers.memberIds = users.map(u => u.id); ticket.step = 'active'; saveDb();
     await message.channel.send({ embeds: [new EmbedBuilder().setColor(0x57f287).setDescription(`✅ **${ticket.answers.memberIds.length}** members recorded.`).setTimestamp()] });
     await sleep(700);
     await message.channel.send({ embeds: [buildFgStepEmbed('active')] }); return;
@@ -2203,10 +2215,11 @@ async function startFgApplication(message) {
 
 // ── Approval ─────────────────────────────────────────────────────────────────
 async function approveFgApplication(interaction, app) {
+  // Defer FIRST — any throw before this causes "This interaction failed"
+  // (caller already deferred in the button handler, so this is a no-op safety net)
   const { guild } = interaction;
   const cfg       = getFgConfig(guild.id);
   const { answers } = app;
-  await interaction.deferUpdate();
 
   const color = answers.color ? Number.parseInt(answers.color.replace('#', ''), 16) : 0x5865f2;
   const fgId  = app.id;
@@ -2296,7 +2309,6 @@ async function approveFgApplication(interaction, app) {
 async function denyFgApplication(interaction, app) {
   const { guild } = interaction;
   const { answers } = app;
-  await interaction.deferUpdate();
 
   await interaction.message.edit({
     embeds:     [buildFgReviewEmbed(answers, app.applicantId).setColor(0xed4245).setTitle('❌ Friend Group Application — DENIED').setDescription(`Denied by <@${interaction.user.id}>`)],
@@ -4358,6 +4370,25 @@ client.on('interactionCreate', async (interaction) => {
 
     // ── Buttons ─────────────────────────────────────────────────────────────
     if (interaction.isButton()) {
+      // ── FG Application: Approve / Deny ─────────────────────────────────────
+      if (interaction.customId.startsWith('fg_approve:') || interaction.customId.startsWith('fg_deny:')) {
+        // Acknowledge immediately — any delay risks "This interaction failed"
+        await interaction.deferUpdate().catch(() => null);
+
+        if (!interaction.member?.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
+          await interaction.followUp({ content: '❌ You need **Manage Server** to review applications.', flags: MessageFlags.Ephemeral }).catch(() => null);
+          return;
+        }
+        const fgAppId   = interaction.customId.split(':')[1];
+        const fgAppData = getGuildData(interaction.guild.id);
+        const fgApp     = fgAppData.fgPendingApps?.[fgAppId];
+        if (!fgApp) {
+          await interaction.followUp({ content: '❌ Application not found — it may have already been approved or denied.', flags: MessageFlags.Ephemeral }).catch(() => null);
+          return;
+        }
+        if (interaction.customId.startsWith('fg_approve:')) return approveFgApplication(interaction, fgApp);
+        return denyFgApplication(interaction, fgApp);
+      }
       if (interaction.customId.startsWith('giveaway_enter:')) {
         await handleGiveawayEntry(interaction);
       }
