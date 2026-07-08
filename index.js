@@ -1902,8 +1902,9 @@ const fgTicketTimeouts = new Map(); // channelId → timeout handle
 
 function getFgConfig(guildId) {
   const data = getGuildData(guildId);
-  if (!data.fgConfig) data.fgConfig = { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, applicationCooldowns: {} };
+  if (!data.fgConfig) data.fgConfig = { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, applicationCooldowns: {}, cooldownResets: {} };
   if (!data.fgConfig.applicationCooldowns) data.fgConfig.applicationCooldowns = {};
+  if (!data.fgConfig.cooldownResets) data.fgConfig.cooldownResets = {};
   return data.fgConfig;
 }
 
@@ -2190,6 +2191,8 @@ async function startFgApplication(message) {
     createdAt: Date.now(),
   };
   cfg.applicationCooldowns[userId] = Date.now();
+  // Clear the one-time reset flag now that the user has used their free slot
+  if (cfg.cooldownResets?.[userId]) delete cfg.cooldownResets[userId];
   saveDb();
 
   await ticketCh.send({ content: `<@${userId}>`, embeds: [buildFgStepEmbed('welcome')], allowedMentions: { users: [userId] } });
@@ -2568,6 +2571,40 @@ async function handleFgAdminCommand(message, sub, args) {
     return message.reply({ embeds: [new EmbedBuilder().setColor(0xed4245).setTitle('🗑️ Recently Deleted Friend Groups').setDescription(lines.join('\n\n')).setFooter({ text: `*fg restore <id> to restore` }).setTimestamp()] });
   }
 
+  if (sub === 'resetcooldown') {
+    const target = message.mentions.users.first();
+    if (!target) return replySyntax(message, `${PREFIX}fg resetcooldown @user`);
+
+    if (!cfg.cooldownResets) cfg.cooldownResets = {};
+
+    // Guard: already reset and they still haven't used it
+    if (cfg.cooldownResets[target.id]) {
+      const lastTs = cfg.applicationCooldowns[target.id] || 0;
+      const resetAt = cfg.cooldownResets[target.id];
+      // The reset happened AFTER their last application, so they still have a free slot pending
+      if (resetAt > lastTs) {
+        return message.reply({ embeds: [simpleEmbed(0xffa500, `❌ ${target}'s cooldown was already reset and they haven't used it yet. Wait until they submit an application before resetting again.`)] });
+      }
+    }
+
+    // Reset: set timestamp to 0 so the cooldown check passes immediately
+    cfg.applicationCooldowns[target.id] = 0;
+    cfg.cooldownResets[target.id]        = Date.now();
+    saveDb();
+
+    return message.reply({
+      embeds: [new EmbedBuilder().setColor(0x57f287)
+        .setTitle('✅ Cooldown Reset')
+        .setDescription(`${target}'s friend group application cooldown has been reset.
+They can now run \`${PREFIX}fg start\` immediately.
+
+> This slot cannot be reset again until they submit a new application.`)
+        .setFooter({ text: `Reset by ${message.author.tag}` })
+        .setTimestamp()],
+      allowedMentions: { parse: [] },
+    });
+  }
+
   return message.reply({ embeds: [simpleEmbed(0x7b48cc, `Unknown admin subcommand. Try \`${PREFIX}fg setup\`.`)] });
 }
 
@@ -2575,7 +2612,7 @@ async function handleFgAdminCommand(message, sub, args) {
 async function handleFgCommand(message, args) {
   const sub = (args.shift() || 'help').toLowerCase();
   if (sub === 'start')                                        return startFgApplication(message);
-  if (['setup', 'restore', 'deleted'].includes(sub))         return handleFgAdminCommand(message, sub, args);
+  if (['setup', 'restore', 'deleted', 'resetcooldown'].includes(sub)) return handleFgAdminCommand(message, sub, args);
   if (['rename', 'color', 'icon', 'add', 'kick', 'info'].includes(sub)) return handleFgOwnerCommand(message, sub, args);
   return message.reply({ embeds: [new EmbedBuilder().setColor(0x7b48cc).setTitle('👥 Friend Group Commands')
     .setDescription([
@@ -2594,6 +2631,7 @@ async function handleFgCommand(message, args) {
       `> \`${PREFIX}fg setup\`         — Configure ticket/review/VC settings`,
       `> \`${PREFIX}fg deleted\`       — View recently deleted groups`,
       `> \`${PREFIX}fg restore <id>\`  — Restore a deleted group`,
+      `> \`${PREFIX}fg resetcooldown @user\` — Reset a user's application cooldown`,
     ].join('\n')).setTimestamp()] });
 }
 
