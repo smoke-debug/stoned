@@ -1864,6 +1864,108 @@ async function handleFriendGroupInteraction(interaction) {
 }
 
 // =========================
+// ANTISPAM / RATE LIMITER
+// Keeps command usage feeling smooth while preventing spam and API hammering.
+// Cooldowns are short and only felt by people actively spamming.
+// The bot owner is always exempt.
+//
+// Tuning (all configurable via env):
+//   COOLDOWN_GENERAL  — ms between any commands           (default 1500)
+//   COOLDOWN_HEAVY    — ms between economy/gambling cmds  (default 2500)
+//   SPAM_THRESHOLD    — commands in window before block    (default 6)
+//   SPAM_WINDOW_MS    — sliding window length in ms        (default 8000)
+//   SPAM_BLOCK_MS     — how long a block lasts            (default 25000)
+// =========================
+
+const COOLDOWN_GENERAL = Number(process.env.COOLDOWN_GENERAL || 1500);
+const COOLDOWN_HEAVY   = Number(process.env.COOLDOWN_HEAVY   || 2500);
+const SPAM_THRESHOLD   = Number(process.env.SPAM_THRESHOLD   || 6);
+const SPAM_WINDOW_MS   = Number(process.env.SPAM_WINDOW_MS   || 8_000);
+const SPAM_BLOCK_MS    = Number(process.env.SPAM_BLOCK_MS    || 25_000);
+
+// In-memory only — resets on restart, no DB needed
+const _cmdCooldowns = new Map(); // "guildId:userId" → last command timestamp
+const _spamTrackers = new Map(); // "guildId:userId" → { count, windowStart, blockedUntil, lastWarnAt }
+
+// Commands that get a longer cooldown (balance-affecting / resource-intensive)
+const HEAVY_CMDS = new Set([
+  'coinflip','cf','slots','slot','dice','roulette','rl',
+  'blackjack','bj','tictactoe','ttt','daily','work','beg','donate','pay',
+]);
+
+/**
+ * Check whether a command from this user should be allowed right now.
+ * Returns null if allowed, or an object describing the block if not.
+ */
+function checkRateLimit(guildId, userId, command) {
+  if (isBotOwner(userId)) return null;  // owner is always exempt
+
+  const key = `${guildId}:${userId}`;
+  const now = Date.now();
+
+  // ── Spam tracker (sliding window) ──────────────────────────────────────────
+  let tracker = _spamTrackers.get(key);
+  if (!tracker) {
+    tracker = { count: 0, windowStart: now, blockedUntil: 0, lastWarnAt: 0 };
+    _spamTrackers.set(key, tracker);
+  }
+
+  // Still blocked?
+  if (now < tracker.blockedUntil) {
+    const remaining = tracker.blockedUntil - now;
+    // Only surface a warning message every 5 seconds so the replies don't pile up
+    if (now - tracker.lastWarnAt >= 5_000) {
+      tracker.lastWarnAt = now;
+      return { type: 'blocked', remainingMs: remaining };
+    }
+    return { type: 'silent' };
+  }
+
+  // Reset window if it has expired
+  if (now - tracker.windowStart > SPAM_WINDOW_MS) {
+    tracker.count       = 0;
+    tracker.windowStart = now;
+  }
+  tracker.count++;
+
+  // Too many commands in the window — apply a block
+  if (tracker.count >= SPAM_THRESHOLD) {
+    tracker.blockedUntil = now + SPAM_BLOCK_MS;
+    tracker.count        = 0;
+    tracker.lastWarnAt   = now;
+    return { type: 'blocked', remainingMs: SPAM_BLOCK_MS };
+  }
+
+  // ── Per-command cooldown ────────────────────────────────────────────────────
+  const cooldownMs = HEAVY_CMDS.has(command) ? COOLDOWN_HEAVY : COOLDOWN_GENERAL;
+  const lastUsed   = _cmdCooldowns.get(key) || 0;
+  const elapsed    = now - lastUsed;
+
+  if (elapsed < cooldownMs) {
+    const remaining = cooldownMs - elapsed;
+    // Don't bother replying for tiny remainders (< 400ms) — just silently drop
+    return remaining < 400 ? { type: 'silent' } : { type: 'cooldown', remainingMs: remaining };
+  }
+
+  _cmdCooldowns.set(key, now);
+  return null; // allowed
+}
+
+async function handleRateLimitReply(message, result) {
+  if (result.type === 'silent') return;
+
+  const embed = result.type === 'blocked'
+    ? new EmbedBuilder().setColor(0xed4245)
+        .setDescription(`⛔ Slow down! You're sending commands too fast.\nTry again in **${Math.ceil(result.remainingMs / 1000)}s**.`)
+    : new EmbedBuilder().setColor(0xffa500)
+        .setDescription(`⏱️ Wait **${(result.remainingMs / 1000).toFixed(1)}s** before using another command.`);
+
+  const ttl   = result.type === 'blocked' ? 5_000 : 3_000;
+  const reply = await message.reply({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => null);
+  if (reply) setTimeout(() => reply.delete().catch(() => null), ttl);
+}
+
+// =========================
 // GENERAL HELPERS
 // =========================
 // Returns true only for the user whose ID matches OWNER_ID env var.
@@ -2586,6 +2688,16 @@ async function tickVcTracking() {
         await endGiveaway(guild.id, id).catch(console.error);
       }
     }
+  }
+
+  // Clean up expired rate limit entries so Maps don't grow unbounded
+  const _cleanNow = Date.now();
+  for (const [k, ts] of _cmdCooldowns) {
+    if (_cleanNow - ts > 10_000) _cmdCooldowns.delete(k);
+  }
+  for (const [k, t] of _spamTrackers) {
+    if (_cleanNow > (t.blockedUntil || 0) && _cleanNow - t.windowStart > SPAM_WINDOW_MS * 3)
+      _spamTrackers.delete(k);
   }
 
   saveDb(); // single batch write after all updates
@@ -3401,7 +3513,13 @@ client.on('messageCreate', async (message) => {
     if (!message.guild || message.author.bot) return;
     rememberLastTextChannel(message);
     if (isTempVcChat(message.channel)) { await message.delete().catch(() => null); return; }
-    if (message.content.startsWith(PREFIX)) { await handleCommand(message); return; }
+    if (message.content.startsWith(PREFIX)) {
+      const _cmd = (message.content.slice(PREFIX.length).trim().split(/\s+/)[0] || '').toLowerCase();
+      const _rl  = checkRateLimit(message.guild.id, message.author.id, _cmd);
+      if (_rl) { await handleRateLimitReply(message, _rl); return; }
+      await handleCommand(message);
+      return;
+    }
     await progressQuest(message.guild, message.member, 'chat', 1, message.channel.id);
     // Buffer message count for giveaway tracking (flushed to DB every 60s)
     const _bufKey = `${message.guild.id}:${message.author.id}`;
