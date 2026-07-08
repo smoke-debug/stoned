@@ -93,7 +93,7 @@ function getGuildData(guildId) {
       giveaways: {},
       modWallet: { whitelist: [], users: {} },
       friendGroups: {},
-      fgConfig: { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, applicationCooldowns: {} },
+      fgConfig: { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, fgRoleAnchorId: null, applicationCooldowns: {} },
       fgTickets: {},
       fgPendingApps: {},
       deletedFriendGroups: {},
@@ -118,7 +118,7 @@ function getGuildData(guildId) {
   if (!Array.isArray(g.modWallet.whitelist)) g.modWallet.whitelist = [];
   if (!g.modWallet.users)               g.modWallet.users = {};
   if (!g.friendGroups)                  g.friendGroups       = {};
-  if (!g.fgConfig)                      g.fgConfig           = { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, applicationCooldowns: {} };
+  if (!g.fgConfig)                      g.fgConfig           = { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, fgRoleAnchorId: null, applicationCooldowns: {} };
   if (!g.fgConfig.applicationCooldowns) g.fgConfig.applicationCooldowns = {};
   if (!g.fgTickets)                     g.fgTickets          = {};
   if (!g.fgPendingApps)                 g.fgPendingApps      = {};
@@ -1903,7 +1903,7 @@ const fgTicketTimeouts = new Map(); // channelId → timeout handle
 
 function getFgConfig(guildId) {
   const data = getGuildData(guildId);
-  if (!data.fgConfig) data.fgConfig = { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, applicationCooldowns: {}, cooldownResets: {} };
+  if (!data.fgConfig) data.fgConfig = { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, fgRoleAnchorId: null, applicationCooldowns: {}, cooldownResets: {} };
   if (!data.fgConfig.applicationCooldowns) data.fgConfig.applicationCooldowns = {};
   if (!data.fgConfig.cooldownResets) data.fgConfig.cooldownResets = {};
   return data.fgConfig;
@@ -2228,6 +2228,14 @@ async function approveFgApplication(interaction, app) {
   const role = await guild.roles.create({ name: answers.name, color, reason: `FG "${answers.name}" approved` }).catch(err => { console.error('[FG] role create:', err.message); return null; });
   if (!role) { return interaction.followUp({ content: '❌ Failed to create FG role — check Manage Roles permission.', flags: MessageFlags.Ephemeral }); }
 
+  // Position the role just below the anchor role (if configured)
+  if (cfg.fgRoleAnchorId) {
+    const _anchor = guild.roles.cache.get(cfg.fgRoleAnchorId);
+    if (_anchor && role.position !== _anchor.position - 1) {
+      await role.setPosition(_anchor.position - 1).catch(err => console.error('[FG] role position error:', err.message));
+    }
+  }
+
   // Assign FG role to all members
   const addedIds = [];
   for (const memberId of (answers.memberIds || [])) {
@@ -2360,6 +2368,14 @@ async function restoreFriendGroup(guild, fgId) {
 
   const role = await guild.roles.create({ name: snap.name, color, reason: `FG "${snap.name}" restored` }).catch(() => null);
   if (!role) return false;
+
+  // Position the role just below the anchor role (if configured)
+  if (cfg.fgRoleAnchorId) {
+    const _anchor = guild.roles.cache.get(cfg.fgRoleAnchorId);
+    if (_anchor && role.position !== _anchor.position - 1) {
+      await role.setPosition(_anchor.position - 1).catch(err => console.error('[FG] role position error:', err.message));
+    }
+  }
 
   const addedBack = [], notFound = [];
   for (const id of (snap.memberIds || [])) {
@@ -2546,12 +2562,23 @@ async function handleFgAdminCommand(message, sub, args) {
       cfg.vcCategoryId = target.id; saveDb();
       return message.reply({ embeds: [simpleEmbed(0x57f287, `✅ VC category set to **${target.name}**.`)] });
     }
+    if (type === 'roleanchor') {
+      // Accept a role mention (@Role) or a raw role ID
+      const mentionedRole = message.mentions.roles.first();
+      const roleById      = args[0] ? message.guild.roles.cache.get(args[0]) : null;
+      const anchorRole    = mentionedRole || roleById;
+      if (!anchorRole) return replySyntax(message, `${PREFIX}fg setup roleanchor @Role`, 'Mention or paste the ID of the separator role (e.g. **__ FG __**).');
+      cfg.fgRoleAnchorId = anchorRole.id; saveDb();
+      return message.reply({ embeds: [simpleEmbed(0x57f287, `✅ FG role anchor set to **${anchorRole.name}**.
+New FG roles will be created just below that role in the list.`)] });
+    }
     return message.reply({ embeds: [new EmbedBuilder().setColor(0x7b48cc).setTitle('⚙️ Friend Group Setup')
-      .setDescription([`\`${PREFIX}fg setup tickets #category\``,`\`${PREFIX}fg setup review #channel\``,`\`${PREFIX}fg setup vcs #category\``].join('\n'))
+      .setDescription([`\`${PREFIX}fg setup tickets #category\``,`\`${PREFIX}fg setup review #channel\``,`\`${PREFIX}fg setup vcs #category\``,`\`${PREFIX}fg setup roleanchor @Role\``].join('\n'))
       .addFields(
         { name: 'Ticket Category', value: cfg.ticketCategoryId ? `<#${cfg.ticketCategoryId}>` : '*(not set)*', inline: true },
         { name: 'Review Channel',  value: cfg.reviewChannelId  ? `<#${cfg.reviewChannelId}>`  : '*(not set)*', inline: true },
         { name: 'VC Category',     value: cfg.vcCategoryId     ? `<#${cfg.vcCategoryId}>`     : '*(not set)*', inline: true },
+        { name: 'Role Anchor',     value: cfg.fgRoleAnchorId   ? `<@&${cfg.fgRoleAnchorId}>`  : '*(not set)*', inline: true },
       ).setTimestamp()] });
   }
 
