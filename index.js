@@ -4249,6 +4249,10 @@ client.on('messageCreate', async (message) => {
     if (!message.guild || message.author.bot) return;
     rememberLastTextChannel(message);
     if (isTempVcChat(message.channel)) { await message.delete().catch(() => null); return; }
+    // Route messages inside FG application ticket channels BEFORE the prefix check
+    if (message.guild && isFgTicketChannel(message.guild.id, message.channel.id)) {
+      await handleFgTicketMessage(message); return;
+    }
     if (message.content.startsWith(PREFIX)) {
       const _cmd = (message.content.slice(PREFIX.length).trim().split(/\s+/)[0] || '').toLowerCase();
       const _rl  = checkRateLimit(message.guild.id, message.author.id, _cmd);
