@@ -5,7 +5,7 @@ const {
   Client, GatewayIntentBits, PermissionsBitField,
   ChannelType, EmbedBuilder, ActionRowBuilder,
   ButtonBuilder, ButtonStyle,
-  REST, Routes, ActivityType,
+  REST, Routes, ActivityType, MessageFlags,
 } = require('discord.js');
 
 // =========================
@@ -93,6 +93,10 @@ function getGuildData(guildId) {
       giveaways: {},
       modWallet: { whitelist: [], users: {} },
       friendGroups: {},
+      fgConfig: { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, applicationCooldowns: {} },
+      fgTickets: {},
+      fgPendingApps: {},
+      deletedFriendGroups: {},
     };
     saveDb();
   }
@@ -113,7 +117,20 @@ function getGuildData(guildId) {
   if (!g.modWallet)                     g.modWallet     = { whitelist: [], users: {} };
   if (!Array.isArray(g.modWallet.whitelist)) g.modWallet.whitelist = [];
   if (!g.modWallet.users)               g.modWallet.users = {};
-  if (!g.friendGroups)                  g.friendGroups  = {};
+  if (!g.friendGroups)                  g.friendGroups       = {};
+  if (!g.fgConfig)                      g.fgConfig           = { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, applicationCooldowns: {} };
+  if (!g.fgConfig.applicationCooldowns) g.fgConfig.applicationCooldowns = {};
+  if (!g.fgTickets)                     g.fgTickets          = {};
+  if (!g.fgPendingApps)                 g.fgPendingApps      = {};
+  if (!g.deletedFriendGroups)           g.deletedFriendGroups = {};
+  // Migrate old name-keyed FGs to add id/vcId/ownerId fields if missing
+  for (const fg of Object.values(g.friendGroups)) {
+    if (!fg.id)       fg.id       = `fg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,7)}`;
+    if (!fg.vcId)     fg.vcId     = null;
+    if (!fg.ownerId)  fg.ownerId  = null;
+    if (!fg.warnedAt) fg.warnedAt = null;
+    if (!fg.source)   fg.source   = 'admin';
+  }
   return g;
 }
 loadDb();
@@ -722,7 +739,7 @@ async function handleStatusRoleInteraction(interaction) {
       return interaction.reply({
         embeds: [new EmbedBuilder().setColor(0xff8a00).setTitle('📋 Status Role Rules')
           .setDescription('No rules yet.\n\nUse `/statusrole add` to create one.\n\n**Example:** substrings: `/pmo`  role1: @Pic')],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
     const lines = data.statusRoles.map((rule, i) => {
@@ -743,13 +760,13 @@ async function handleStatusRoleInteraction(interaction) {
   if (sub === 'check') {
     const targetUser = interaction.options.getUser('user') || interaction.user;
     const member     = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
-    if (!member) return interaction.reply({ content: 'Could not find that user.', ephemeral: true });
+    if (!member) return interaction.reply({ content: 'Could not find that user.', flags: MessageFlags.Ephemeral });
 
     const presence   = interaction.guild.presences.cache.get(targetUser.id);
     const status     = getCustomStatus(presence);
 
     if (!data.statusRoles.length)
-      return interaction.reply({ content: 'No status role rules configured yet.', ephemeral: true });
+      return interaction.reply({ content: 'No status role rules configured yet.', flags: MessageFlags.Ephemeral });
 
     const lines = data.statusRoles.map((rule, i) => {
       const matches = rule.substrings.every((sub) => status.toLowerCase().includes(sub.toLowerCase()));
@@ -776,9 +793,9 @@ async function handleStatusRoleInteraction(interaction) {
     const raw        = interaction.options.getString('substrings', true);
     const substrings = raw.split(',').map((s) => s.trim()).filter(Boolean);
     if (!substrings.length)
-      return interaction.reply({ content: 'Provide at least one substring.', ephemeral: true });
+      return interaction.reply({ content: 'Provide at least one substring.', flags: MessageFlags.Ephemeral });
     if (substrings.some((s) => s.length > 100))
-      return interaction.reply({ content: 'Each substring must be 100 characters or fewer.', ephemeral: true });
+      return interaction.reply({ content: 'Each substring must be 100 characters or fewer.', flags: MessageFlags.Ephemeral });
 
     const r1 = interaction.options.getRole('role1');
     const r2 = interaction.options.getRole('role2');
@@ -790,7 +807,7 @@ async function handleStatusRoleInteraction(interaction) {
     for (const roleId of roleIds) {
       const role = interaction.guild.roles.cache.get(roleId);
       if (role && role.position >= me.roles.highest.position) {
-        return interaction.reply({ content: `I can't assign ${role} — it's the same level or higher than my highest role. Move my role above it first.`, ephemeral: true });
+        return interaction.reply({ content: `I can't assign ${role} — it's the same level or higher than my highest role. Move my role above it first.`, flags: MessageFlags.Ephemeral });
       }
     }
 
@@ -832,7 +849,7 @@ async function handleStatusRoleInteraction(interaction) {
   if (sub === 'remove') {
     const num = interaction.options.getInteger('rule', true);
     if (num < 1 || num > data.statusRoles.length)
-      return interaction.reply({ content: `Rule #${num} doesn\'t exist. Use /statusrole list to see all rules.`, ephemeral: true });
+      return interaction.reply({ content: `Rule #${num} doesn\'t exist. Use /statusrole list to see all rules.`, flags: MessageFlags.Ephemeral });
 
     const removed = data.statusRoles.splice(num - 1, 1)[0];
     saveDb();
@@ -1057,18 +1074,18 @@ async function handleGiveawayEntry(interaction) {
   const giveaway   = data.giveaways?.[giveawayId];
 
   if (!giveaway || giveaway.ended || giveaway.cancelled)
-    return interaction.reply({ content: 'This giveaway is no longer active.', ephemeral: true });
+    return interaction.reply({ content: 'This giveaway is no longer active.', flags: MessageFlags.Ephemeral });
   if (Date.now() > giveaway.endsAt)
-    return interaction.reply({ content: 'This giveaway has already expired.', ephemeral: true });
+    return interaction.reply({ content: 'This giveaway has already expired.', flags: MessageFlags.Ephemeral });
   if ((giveaway.entrants || []).includes(interaction.user.id)) {
     return interaction.reply({
       embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(`🎟️ You're already entered! Good luck — winners drawn <t:${Math.floor(giveaway.endsAt / 1000)}:R>.`)],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   // Defer early — requirement check can involve DB reads + VC time calcs
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const missing = await checkGiveawayRequirements(giveaway, interaction.member, guild);
 
@@ -1122,7 +1139,7 @@ async function handleGiveawaySlashCommand(interaction) {
   // /giveaway list — public
   if (sub === 'list') {
     const active = Object.values(data.giveaways || {}).filter(g => !g.ended && !g.cancelled);
-    if (!active.length) return interaction.reply({ embeds: [simpleEmbed(0xff8a00, 'No active giveaways right now.')], ephemeral: true });
+    if (!active.length) return interaction.reply({ embeds: [simpleEmbed(0xff8a00, 'No active giveaways right now.')], flags: MessageFlags.Ephemeral });
     const lines = active.map((g, i) => {
       const ch = interaction.guild.channels.cache.get(g.channelId);
       return `**${i + 1}.** **${g.prize}** in ${ch ? `<#${g.channelId}>` : '`unknown`'} — ends <t:${Math.floor(g.endsAt / 1000)}:R> — **${(g.entrants||[]).length}** ${(g.entrants||[]).length === 1 ? 'entry' : 'entries'}`;
@@ -1134,7 +1151,7 @@ async function handleGiveawaySlashCommand(interaction) {
 
   // All other subcommands require Manage Server
   if (!interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild))
-    return interaction.reply({ content: 'You need **Manage Server** for this command.', ephemeral: true });
+    return interaction.reply({ content: 'You need **Manage Server** for this command.', flags: MessageFlags.Ephemeral });
 
   // /giveaway create
   if (sub === 'create') {
@@ -1147,10 +1164,10 @@ async function handleGiveawaySlashCommand(interaction) {
     const minMessages = interaction.options.getInteger('min_messages') ?? 0;
     const minVcHours  = interaction.options.getNumber('min_vc_hours') ?? 0;
 
-    if (!channel.isTextBased()) return interaction.reply({ content: 'Please choose a text channel.', ephemeral: true });
+    if (!channel.isTextBased()) return interaction.reply({ content: 'Please choose a text channel.', flags: MessageFlags.Ephemeral });
     const durationMs = parseTimeArg(durationStr);
-    if (!durationMs || durationMs < 60_000) return interaction.reply({ content: 'Invalid duration. Try `30m`, `1h`, `24h`, or `7d`.', ephemeral: true });
-    if (prize.length > 100) return interaction.reply({ content: 'Prize name must be 100 characters or fewer.', ephemeral: true });
+    if (!durationMs || durationMs < 60_000) return interaction.reply({ content: 'Invalid duration. Try `30m`, `1h`, `24h`, or `7d`.', flags: MessageFlags.Ephemeral });
+    if (prize.length > 100) return interaction.reply({ content: 'Prize name must be 100 characters or fewer.', flags: MessageFlags.Ephemeral });
 
     const endsAt   = Date.now() + durationMs;
     const giveaway = {
@@ -1164,7 +1181,7 @@ async function handleGiveawaySlashCommand(interaction) {
       snapshots: {},
     };
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const msg = await channel.send({
       embeds:     [buildGiveawayEmbed({ ...giveaway, id: 'pending' }, interaction.guild)],
@@ -1204,10 +1221,10 @@ async function handleGiveawaySlashCommand(interaction) {
   if (sub === 'end') {
     const msgId    = interaction.options.getString('message_id', true).trim();
     const giveaway = data.giveaways?.[msgId];
-    if (!giveaway)          return interaction.reply({ content: 'Giveaway not found. Check the message ID with `/giveaway list`.', ephemeral: true });
-    if (giveaway.ended)     return interaction.reply({ content: 'That giveaway already ended.', ephemeral: true });
-    if (giveaway.cancelled) return interaction.reply({ content: 'That giveaway was cancelled.', ephemeral: true });
-    await interaction.deferReply({ ephemeral: true });
+    if (!giveaway)          return interaction.reply({ content: 'Giveaway not found. Check the message ID with `/giveaway list`.', flags: MessageFlags.Ephemeral });
+    if (giveaway.ended)     return interaction.reply({ content: 'That giveaway already ended.', flags: MessageFlags.Ephemeral });
+    if (giveaway.cancelled) return interaction.reply({ content: 'That giveaway was cancelled.', flags: MessageFlags.Ephemeral });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     await endGiveaway(interaction.guild.id, msgId);
     return interaction.editReply(`✅ **${giveaway.prize}** has ended — winners have been announced.`);
   }
@@ -1217,9 +1234,9 @@ async function handleGiveawaySlashCommand(interaction) {
     const msgId    = interaction.options.getString('message_id', true).trim();
     const newCount = interaction.options.getInteger('winners');
     const giveaway = data.giveaways?.[msgId];
-    if (!giveaway)              return interaction.reply({ content: 'Giveaway not found.', ephemeral: true });
-    if (!giveaway.ended)        return interaction.reply({ content: "That giveaway hasn't ended yet. Use `/giveaway end` first.", ephemeral: true });
-    if (!(giveaway.entrants||[]).length) return interaction.reply({ content: 'No entries to reroll from.', ephemeral: true });
+    if (!giveaway)              return interaction.reply({ content: 'Giveaway not found.', flags: MessageFlags.Ephemeral });
+    if (!giveaway.ended)        return interaction.reply({ content: "That giveaway hasn't ended yet. Use `/giveaway end` first.", flags: MessageFlags.Ephemeral });
+    if (!(giveaway.entrants||[]).length) return interaction.reply({ content: 'No entries to reroll from.', flags: MessageFlags.Ephemeral });
 
     const count   = newCount ?? giveaway.winnerCount;
     const pool    = [...(giveaway.entrants || [])];
@@ -1241,16 +1258,16 @@ async function handleGiveawaySlashCommand(interaction) {
         allowedMentions: { users: winners },
       }).catch(() => null);
     }
-    return interaction.reply({ content: `✅ Rerolled! New winner(s): ${winners.map(id => `<@${id}>`).join(', ')}`, ephemeral: true });
+    return interaction.reply({ content: `✅ Rerolled! New winner(s): ${winners.map(id => `<@${id}>`).join(', ')}`, flags: MessageFlags.Ephemeral });
   }
 
   // /giveaway cancel
   if (sub === 'cancel') {
     const msgId    = interaction.options.getString('message_id', true).trim();
     const giveaway = data.giveaways?.[msgId];
-    if (!giveaway)                              return interaction.reply({ content: 'Giveaway not found.', ephemeral: true });
-    if (giveaway.cancelled)                     return interaction.reply({ content: 'Already cancelled.', ephemeral: true });
-    if (giveaway.ended && !giveaway.cancelled)  return interaction.reply({ content: 'That giveaway already ended.', ephemeral: true });
+    if (!giveaway)                              return interaction.reply({ content: 'Giveaway not found.', flags: MessageFlags.Ephemeral });
+    if (giveaway.cancelled)                     return interaction.reply({ content: 'Already cancelled.', flags: MessageFlags.Ephemeral });
+    if (giveaway.ended && !giveaway.cancelled)  return interaction.reply({ content: 'That giveaway already ended.', flags: MessageFlags.Ephemeral });
 
     giveaway.cancelled = true;
     giveaway.ended     = true;
@@ -1262,7 +1279,7 @@ async function handleGiveawaySlashCommand(interaction) {
       const msg = await channel.messages.fetch(msgId).catch(() => null);
       if (msg) await msg.edit({ embeds: [buildGiveawayEmbed(giveaway, interaction.guild)], components: [] }).catch(() => null);
     }
-    return interaction.reply({ content: `✅ **${giveaway.prize}** giveaway cancelled.`, ephemeral: true });
+    return interaction.reply({ content: `✅ **${giveaway.prize}** giveaway cancelled.`, flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -1562,7 +1579,10 @@ function getFriendGroupList(guildId) {
 // Case-insensitive group lookup — returns { key, group } or null
 function findFriendGroup(guildId, name) {
   const groups = getFriendGroupList(guildId);
-  const key    = Object.keys(groups).find(k => k.toLowerCase() === name.toLowerCase());
+  // key match (admin-created where key = name)
+  let key = Object.keys(groups).find(k => k.toLowerCase() === name.toLowerCase());
+  // name-field match (application-created where key = generated ID)
+  if (!key) key = Object.keys(groups).find(k => (groups[k].name || '').toLowerCase() === name.toLowerCase());
   return key ? { key, group: groups[key] } : null;
 }
 
@@ -1632,7 +1652,7 @@ function buildFriendGroupStatsEmbed(guildId, guild, group) {
         inline: false,
       },
     )
-    .setFooter({ text: '🔴 = currently in VC  ꔷ  Click 🔄 to refresh' })
+    .setFooter({ text: `🔴 = currently in VC  ꔷ  ID: ${group.id || '—'}  ꔷ  🔄 to refresh` })
     .setTimestamp();
 }
 
@@ -1657,7 +1677,7 @@ async function handleFriendGroupInteraction(interaction) {
     if (!groups.length) {
       return interaction.reply({
         embeds: [simpleEmbed(0x5865f2, 'No friend groups yet.\n\nCreate one with `/friendgroup create`.')],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
     const lines = groups.map((g, i) => {
@@ -1676,7 +1696,7 @@ async function handleFriendGroupInteraction(interaction) {
     const name  = interaction.options.getString('name', true);
     const found = findFriendGroup(interaction.guild.id, name);
     if (!found)
-      return interaction.reply({ content: `Friend group \`${name}\` not found. Use \`/friendgroup list\` to see all groups.`, ephemeral: true });
+      return interaction.reply({ content: `Friend group \`${name}\` not found. Use \`/friendgroup list\` to see all groups.`, flags: MessageFlags.Ephemeral });
     return interaction.reply({
       embeds:     [buildFriendGroupStatsEmbed(interaction.guild.id, interaction.guild, found.group)],
       components: buildFriendGroupRefreshRow(found.key),
@@ -1686,7 +1706,7 @@ async function handleFriendGroupInteraction(interaction) {
 
   // ── Manage Server required below ───────────────────────────────────────────
   if (!interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild))
-    return interaction.reply({ content: 'You need **Manage Server** to manage friend groups.', ephemeral: true });
+    return interaction.reply({ content: 'You need **Manage Server** to manage friend groups.', flags: MessageFlags.Ephemeral });
 
   // ── create ─────────────────────────────────────────────────────────────────
   if (sub === 'create') {
@@ -1696,11 +1716,11 @@ async function handleFriendGroupInteraction(interaction) {
     const userIds   = parseUserIdsFromText(membersIn);
 
     if (!name || name.length > 50)
-      return interaction.reply({ content: 'Group name must be 1–50 characters.', ephemeral: true });
+      return interaction.reply({ content: 'Group name must be 1–50 characters.', flags: MessageFlags.Ephemeral });
     if (findFriendGroup(interaction.guild.id, name))
-      return interaction.reply({ content: `A group called \`${name}\` already exists.`, ephemeral: true });
+      return interaction.reply({ content: `A group called \`${name}\` already exists.`, flags: MessageFlags.Ephemeral });
     if (!userIds.length)
-      return interaction.reply({ content: 'Mention at least one member, e.g. `@user1 @user2 @user3`.', ephemeral: true });
+      return interaction.reply({ content: 'Mention at least one member, e.g. `@user1 @user2 @user3`.', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
 
@@ -1726,8 +1746,11 @@ async function handleFriendGroupInteraction(interaction) {
       } catch { failed.push(member.id); }
     }
 
+    const _newFgId = `fg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,7)}`;
     data.friendGroups[name] = {
-      name, roleId: role.id, memberIds,
+      id: _newFgId, name, roleId: role.id, vcId: null,
+      ownerId: null, memberIds, color: null, paid: false,
+      active: true, source: 'admin', warnedAt: null,
       createdAt: Date.now(), createdBy: interaction.user.id,
     };
     saveDb();
@@ -1756,14 +1779,14 @@ async function handleFriendGroupInteraction(interaction) {
   if (sub === 'add') {
     const name      = interaction.options.getString('name', true);
     const found     = findFriendGroup(interaction.guild.id, name);
-    if (!found) return interaction.reply({ content: `Group \`${name}\` not found.`, ephemeral: true });
+    if (!found) return interaction.reply({ content: `Group \`${name}\` not found.`, flags: MessageFlags.Ephemeral });
     const { key, group } = found;
     const role      = group.roleId ? interaction.guild.roles.cache.get(group.roleId) : null;
     const membersIn = interaction.options.getString('members', true);
     const userIds   = parseUserIdsFromText(membersIn);
 
     if (!userIds.length)
-      return interaction.reply({ content: 'Mention at least one member, e.g. `@user1 @user2 @user3`.', ephemeral: true });
+      return interaction.reply({ content: 'Mention at least one member, e.g. `@user1 @user2 @user3`.', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
 
@@ -1803,14 +1826,14 @@ async function handleFriendGroupInteraction(interaction) {
   if (sub === 'remove') {
     const name      = interaction.options.getString('name', true);
     const found     = findFriendGroup(interaction.guild.id, name);
-    if (!found) return interaction.reply({ content: `Group \`${name}\` not found.`, ephemeral: true });
+    if (!found) return interaction.reply({ content: `Group \`${name}\` not found.`, flags: MessageFlags.Ephemeral });
     const { key, group } = found;
     const role      = group.roleId ? interaction.guild.roles.cache.get(group.roleId) : null;
     const membersIn = interaction.options.getString('members', true);
     const userIds   = parseUserIdsFromText(membersIn);
 
     if (!userIds.length)
-      return interaction.reply({ content: 'Mention at least one member, e.g. `@user1 @user2 @user3`.', ephemeral: true });
+      return interaction.reply({ content: 'Mention at least one member, e.g. `@user1 @user2 @user3`.', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
 
@@ -1844,7 +1867,7 @@ async function handleFriendGroupInteraction(interaction) {
   if (sub === 'delete') {
     const name  = interaction.options.getString('name', true);
     const found = findFriendGroup(interaction.guild.id, name);
-    if (!found) return interaction.reply({ content: `Group \`${name}\` not found.`, ephemeral: true });
+    if (!found) return interaction.reply({ content: `Group \`${name}\` not found.`, flags: MessageFlags.Ephemeral });
     const { key, group } = found;
 
     await interaction.deferReply();
@@ -1861,6 +1884,717 @@ async function handleFriendGroupInteraction(interaction) {
         .setTimestamp()],
     });
   }
+}
+
+// =========================
+// FRIEND GROUP APPLICATION SYSTEM
+// Handles: ticket creation, guided Q&A, admin review, approval/denial,
+//          owner management, member-count warnings/deletion, and restore.
+// =========================
+
+const FG_APP_COOLDOWN_MS     = 12 * 60 * 60 * 1000; // 12h between applications per user
+const FG_TICKET_TIMEOUT_MS   = 30 * 60 * 1000;       // ticket auto-closes after 30min inactivity
+const FG_MIN_MEMBERS         = 5;                      // minimum members required
+const FG_WARNING_DURATION_MS = 24 * 60 * 60 * 1000;  // 24h to fix member count
+
+// In-memory only — not persisted (NodeJS timer handles)
+const fgTicketTimeouts = new Map(); // channelId → timeout handle
+
+function getFgConfig(guildId) {
+  const data = getGuildData(guildId);
+  if (!data.fgConfig) data.fgConfig = { ticketCategoryId: null, reviewChannelId: null, vcCategoryId: null, fgOwnerRoleId: null, applicationCooldowns: {} };
+  if (!data.fgConfig.applicationCooldowns) data.fgConfig.applicationCooldowns = {};
+  return data.fgConfig;
+}
+
+function generateFgId() {
+  return `fg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function isFgTicketChannel(guildId, channelId) {
+  return Boolean(getGuildData(guildId).fgTickets?.[channelId]);
+}
+
+// Permission overwrites for a locked FG voice channel
+function fgVcPerms(guild, fgRoleId) {
+  return [
+    {
+      id:   guild.roles.everyone.id,
+      deny: [PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.Speak, PermissionsBitField.Flags.SendMessages],
+      allow: [PermissionsBitField.Flags.ViewChannel],
+    },
+    {
+      id:   fgRoleId,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.Speak, PermissionsBitField.Flags.Stream, PermissionsBitField.Flags.UseVAD],
+    },
+    {
+      id:   guild.members.me.id,
+      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.Speak, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.MoveMembers],
+    },
+  ];
+}
+
+// Per-step question embeds
+function buildFgStepEmbed(step, extras = {}) {
+  const b = () => new EmbedBuilder().setColor(0x7b48cc).setTimestamp();
+  switch (step) {
+    case 'welcome': return b()
+      .setTitle('👥 Friend Group Application')
+      .setDescription('Welcome! This is the official friend group creation process.\n\nAnswer each question carefully — this ticket auto-closes after **30 minutes** of inactivity.\n\nType **`start`** when you\'re ready to begin.')
+      .setFooter({ text: 'All responses are logged and reviewed by staff.' });
+    case 'owner': return b()
+      .setTitle('👑 Step 1 / 6 — Group Owner')
+      .setDescription('Who is the **owner** of this friend group?\n\n**Mention** them below. (e.g. `@username`)\n\n> The owner manages the group and receives a special role.');
+    case 'count': return b()
+      .setTitle('👥 Step 2 / 6 — Member Count')
+      .setDescription(`How many members are in your friend group?\n\n> ⚠️ **Minimum of ${FG_MIN_MEMBERS} members required.**\n\nReply with a number.`);
+    case 'members': return b()
+      .setTitle('🔖 Step 3 / 6 — Tag Your Members')
+      .setDescription(`Please **mention all ${extras.count || FG_MIN_MEMBERS} members** in a single message.\n\nExample: \`@user1 @user2 @user3 @user4 @user5\``)
+      .setFooter({ text: `At least ${FG_MIN_MEMBERS} member mentions required.` });
+    case 'active': return b()
+      .setTitle('✅ Step 4 / 6 — Activity Status')
+      .setDescription('Is your friend group currently **active**?\n\nReply with **yes** or **no**.');
+    case 'name': return b()
+      .setTitle('🏷️ Step 5 / 6 — Group Name')
+      .setDescription('What is the **name** of your friend group?\n\n*(This will become the role name and VC name — max 50 characters.)*');
+    case 'color': return b()
+      .setTitle('🎨 Step 6 / 6 — Role Color')
+      .setDescription('What **color** would you like for the group role?\n\nProvide a hex code (e.g. `#FF69B4`) or type **`none`** for the default purple.');
+    case 'paid': return b()
+      .setTitle('💰 Final Question — Paid Opportunities')
+      .setDescription('Are you applying for **paid friend group opportunities**?\n\nReply with **yes** or **no**.');
+    default: return b().setDescription('Unknown step.');
+  }
+}
+
+// Admin review embed shown in the review channel
+function buildFgReviewEmbed(answers, applicantId) {
+  const color   = answers.color ? Number.parseInt(answers.color.replace('#', ''), 16) : 0x7b48cc;
+  const members = (answers.memberIds || []).map(id => `<@${id}>`).join(', ') || '*(none)*';
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle('📋 New Friend Group Application')
+    .setDescription('A friend group application is pending review.')
+    .addFields(
+      { name: '📝 Applicant',    value: `<@${applicantId}>`,                                  inline: true  },
+      { name: '👑 Owner',        value: answers.ownerId ? `<@${answers.ownerId}>` : '*(none)*', inline: true  },
+      { name: '\u200b',          value: '\u200b',                                              inline: true  },
+      { name: '📊 Count',        value: String((answers.memberIds || []).length),              inline: true  },
+      { name: '✅ Active',       value: answers.active ? 'Yes' : 'No',                         inline: true  },
+      { name: '💰 Paid Opps.',   value: answers.paid   ? 'Yes' : 'No',                         inline: true  },
+      { name: '🏷️ Name',        value: answers.name  || '*(not set)*',                        inline: true  },
+      { name: '🎨 Color',        value: answers.color || '*(none)*',                           inline: true  },
+      { name: '\u200b',          value: '\u200b',                                              inline: true  },
+      { name: '👥 Members',      value: members.slice(0, 1024),                                inline: false },
+    )
+    .setFooter({ text: 'Use the buttons below to approve or deny.' })
+    .setTimestamp();
+}
+
+// Manage the inactivity timeout for a ticket channel
+function resetFgTicketTimeout(guild, channelId) {
+  if (fgTicketTimeouts.has(channelId)) clearTimeout(fgTicketTimeouts.get(channelId));
+  const handle = setTimeout(async () => {
+    const ch = guild.channels.cache.get(channelId);
+    if (ch) await ch.send({ embeds: [simpleEmbed(0x888888, '⏰ This ticket has been automatically closed due to inactivity.')] }).catch(() => null);
+    await closeFgTicket(guild, channelId);
+  }, FG_TICKET_TIMEOUT_MS);
+  fgTicketTimeouts.set(channelId, handle);
+}
+
+async function closeFgTicket(guild, channelId, delayMs = 0) {
+  if (delayMs > 0) await sleep(delayMs);
+  if (fgTicketTimeouts.has(channelId)) { clearTimeout(fgTicketTimeouts.get(channelId)); fgTicketTimeouts.delete(channelId); }
+  const ch = guild.channels.cache.get(channelId);
+  if (ch) await ch.delete('FG application ticket closed').catch(() => null);
+  const data = getGuildData(guild.id);
+  if (data.fgTickets?.[channelId]) { delete data.fgTickets[channelId]; saveDb(); }
+}
+
+async function submitFgApplication(guild, ticket) {
+  const cfg = getFgConfig(guild.id);
+  if (!cfg.reviewChannelId) { console.error('[FG] No review channel configured.'); return false; }
+  const reviewCh = guild.channels.cache.get(cfg.reviewChannelId);
+  if (!reviewCh?.isTextBased()) return false;
+
+  const appId = generateFgId();
+  const msg   = await reviewCh.send({
+    embeds:     [buildFgReviewEmbed(ticket.answers, ticket.applicantId)],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`fg_approve:${appId}`).setLabel('Approve').setStyle(ButtonStyle.Success).setEmoji('✅'),
+      new ButtonBuilder().setCustomId(`fg_deny:${appId}`).setLabel('Deny').setStyle(ButtonStyle.Danger).setEmoji('❌'),
+    )],
+    allowedMentions: { parse: [] },
+  }).catch(err => { console.error('[FG] review send error:', err.message); return null; });
+
+  if (!msg) return false;
+
+  const data = getGuildData(guild.id);
+  if (!data.fgPendingApps) data.fgPendingApps = {};
+  data.fgPendingApps[appId] = {
+    id: appId, messageId: msg.id, reviewChannelId: cfg.reviewChannelId,
+    applicantId: ticket.applicantId, answers: ticket.answers, submittedAt: Date.now(),
+  };
+  saveDb();
+  return true;
+}
+
+// ── Guided Q&A step machine ──────────────────────────────────────────────────
+async function handleFgTicketMessage(message) {
+  const data   = getGuildData(message.guild.id);
+  const ticket = data.fgTickets?.[message.channel.id];
+  if (!ticket || message.author.id !== ticket.applicantId || message.author.bot) return;
+
+  const content = message.content.trim();
+  const step    = ticket.step;
+
+  resetFgTicketTimeout(message.guild, message.channel.id);
+
+  // ── welcome ──
+  if (step === 'welcome') {
+    if (content.toLowerCase() !== 'start') {
+      await message.reply({ embeds: [simpleEmbed(0xffa500, 'Type **`start`** to begin your application.')] }); return;
+    }
+    ticket.step = 'owner'; saveDb();
+    await message.channel.send({ embeds: [buildFgStepEmbed('owner')] }); return;
+  }
+
+  // ── owner ──
+  if (step === 'owner') {
+    const mentioned = message.mentions.users.first();
+    if (!mentioned)    { await message.reply({ embeds: [simpleEmbed(0xed4245, '❌ Please **mention** the owner (e.g. `@username`).')] }); return; }
+    if (mentioned.bot) { await message.reply({ embeds: [simpleEmbed(0xed4245, '❌ The owner cannot be a bot.')] }); return; }
+    ticket.answers.ownerId = mentioned.id; ticket.step = 'count'; saveDb();
+    await message.channel.send({ embeds: [buildFgStepEmbed('count')] }); return;
+  }
+
+  // ── count ──
+  if (step === 'count') {
+    const n = Number.parseInt(content, 10);
+    if (!Number.isFinite(n) || n < 1) { await message.reply({ embeds: [simpleEmbed(0xed4245, '❌ Please enter a valid number.')] }); return; }
+    if (n < FG_MIN_MEMBERS) {
+      await message.channel.send({ embeds: [new EmbedBuilder().setColor(0xed4245)
+        .setTitle('❌ Not Enough Members')
+        .setDescription(`Friend groups need at least **${FG_MIN_MEMBERS} members**.\n\nYou entered **${n}**. Please reapply once you have enough members.\n\n> ⏰ This ticket closes in **30 seconds**.`)
+        .setTimestamp()] });
+      closeFgTicket(message.guild, message.channel.id, 30_000); return;
+    }
+    ticket.answers.memberCount = n; ticket.step = 'members'; saveDb();
+    await message.channel.send({ embeds: [buildFgStepEmbed('members', { count: n })] }); return;
+  }
+
+  // ── members ──
+  if (step === 'members') {
+    const users = [...message.mentions.users.values()].filter(u => !u.bot);
+    if (users.length < FG_MIN_MEMBERS) {
+      await message.reply({ embeds: [simpleEmbed(0xed4245, `❌ Need at least **${FG_MIN_MEMBERS}** member mentions — you mentioned **${users.length}**. Try again.`)] }); return;
+    }
+    ticket.answers.memberIds = [...new Set(users.map(u => u.id))]; ticket.step = 'active'; saveDb();
+    await message.channel.send({ embeds: [new EmbedBuilder().setColor(0x57f287).setDescription(`✅ **${ticket.answers.memberIds.length}** members recorded.`).setTimestamp()] });
+    await sleep(700);
+    await message.channel.send({ embeds: [buildFgStepEmbed('active')] }); return;
+  }
+
+  // ── active ──
+  if (step === 'active') {
+    const lower = content.toLowerCase();
+    if (!['yes', 'no'].includes(lower)) { await message.reply({ embeds: [simpleEmbed(0xed4245, '❌ Reply with **yes** or **no**.')] }); return; }
+    ticket.answers.active = lower === 'yes'; ticket.step = 'name'; saveDb();
+    await message.channel.send({ embeds: [buildFgStepEmbed('name')] }); return;
+  }
+
+  // ── name ──
+  if (step === 'name') {
+    if (!content || content.length > 50) { await message.reply({ embeds: [simpleEmbed(0xed4245, '❌ Name must be 1–50 characters.')] }); return; }
+    if (findFriendGroup(message.guild.id, content)) { await message.reply({ embeds: [simpleEmbed(0xed4245, `❌ A friend group named **${content}** already exists. Choose a different name.`)] }); return; }
+    ticket.answers.name = content; ticket.step = 'color'; saveDb();
+    await message.channel.send({ embeds: [buildFgStepEmbed('color')] }); return;
+  }
+
+  // ── color ──
+  if (step === 'color') {
+    const lower = content.toLowerCase();
+    if (lower === 'none') {
+      ticket.answers.color = null;
+    } else {
+      const hex = lower.replace('#', '');
+      if (!/^[0-9a-f]{6}$/.test(hex)) { await message.reply({ embeds: [simpleEmbed(0xed4245, '❌ Invalid hex color. Use a 6-digit hex like `#FF69B4` or type **none**.')] }); return; }
+      ticket.answers.color = `#${hex.toUpperCase()}`;
+    }
+    ticket.step = 'paid'; saveDb();
+    await message.channel.send({ embeds: [buildFgStepEmbed('paid')] }); return;
+  }
+
+  // ── paid → submit ──
+  if (step === 'paid') {
+    const lower = content.toLowerCase();
+    if (!['yes', 'no'].includes(lower)) { await message.reply({ embeds: [simpleEmbed(0xed4245, '❌ Reply with **yes** or **no**.')] }); return; }
+    ticket.answers.paid = lower === 'yes'; ticket.step = 'done'; saveDb();
+
+    await message.channel.send({ embeds: [new EmbedBuilder().setColor(0x57f287)
+      .setTitle('✅ Application Submitted!')
+      .setDescription('Your friend group application has been sent to the admins.\n\nYou will receive a DM once a decision is made.\n\n> ⏰ This channel closes in **10 seconds**.')
+      .setTimestamp()] });
+
+    const sent = await submitFgApplication(message.guild, ticket);
+    if (!sent) await message.channel.send({ embeds: [simpleEmbed(0xffa500, '⚠️ Could not forward to review channel — contact an admin.')] });
+
+    delete data.fgTickets[message.channel.id]; saveDb();
+    closeFgTicket(message.guild, message.channel.id, 10_000);
+  }
+}
+
+async function startFgApplication(message) {
+  const cfg     = getFgConfig(message.guild.id);
+  const userId  = message.author.id;
+
+  // Cooldown
+  const lastApp = cfg.applicationCooldowns[userId] || 0;
+  if (Date.now() - lastApp < FG_APP_COOLDOWN_MS) {
+    const rem = FG_APP_COOLDOWN_MS - (Date.now() - lastApp);
+    return message.reply({ embeds: [simpleEmbed(0xffa500, `⏳ Please wait **${formatDuration(rem)}** before submitting another application.`)] });
+  }
+
+  // Existing open ticket?
+  const data     = getGuildData(message.guild.id);
+  const existing = Object.values(data.fgTickets || {}).find(t => t.applicantId === userId);
+  if (existing) {
+    const ch = message.guild.channels.cache.get(existing.channelId);
+    return message.reply({ embeds: [simpleEmbed(0xffa500, `You already have an open application ticket${ch ? ` in ${ch}` : ''}. Complete it or wait for it to expire.`)] });
+  }
+
+  if (!cfg.ticketCategoryId) return message.reply({ embeds: [simpleEmbed(0xed4245, '❌ The friend group system has not been configured yet. Contact an admin.')] });
+
+  // Create hidden ticket channel
+  const slug     = (message.member?.displayName || message.author.username).toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 18);
+  const ticketCh = await message.guild.channels.create({
+    name:   `fg-${slug}`,
+    type:   ChannelType.GuildText,
+    parent: cfg.ticketCategoryId,
+    permissionOverwrites: [
+      { id: message.guild.roles.everyone.id, deny:  [PermissionsBitField.Flags.ViewChannel] },
+      { id: userId,                          allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
+      { id: message.guild.members.me.id,    allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageChannels, PermissionsBitField.Flags.ReadMessageHistory] },
+    ],
+    reason: `FG application by ${message.author.tag}`,
+  }).catch(err => { console.error('[FG] ticket create error:', err.message); return null; });
+
+  if (!ticketCh) return message.reply({ embeds: [simpleEmbed(0xed4245, '❌ Could not create your ticket channel — check my permissions.')] });
+
+  // Persist ticket
+  if (!data.fgTickets) data.fgTickets = {};
+  data.fgTickets[ticketCh.id] = {
+    channelId: ticketCh.id, applicantId: userId, step: 'welcome',
+    answers: { ownerId: null, memberCount: 0, memberIds: [], active: null, name: null, color: null, paid: null },
+    createdAt: Date.now(),
+  };
+  cfg.applicationCooldowns[userId] = Date.now();
+  saveDb();
+
+  await ticketCh.send({ content: `<@${userId}>`, embeds: [buildFgStepEmbed('welcome')], allowedMentions: { users: [userId] } });
+  await message.reply({ embeds: [simpleEmbed(0x7b48cc, `✅ Your application ticket has been created! Head over to ${ticketCh}.`)] });
+
+  resetFgTicketTimeout(message.guild, ticketCh.id);
+}
+
+// ── Approval ─────────────────────────────────────────────────────────────────
+async function approveFgApplication(interaction, app) {
+  const { guild } = interaction;
+  const cfg       = getFgConfig(guild.id);
+  const { answers } = app;
+  await interaction.deferUpdate();
+
+  const color = answers.color ? Number.parseInt(answers.color.replace('#', ''), 16) : 0x5865f2;
+  const fgId  = app.id;
+
+  // Create FG role
+  const role = await guild.roles.create({ name: answers.name, color, reason: `FG "${answers.name}" approved` }).catch(err => { console.error('[FG] role create:', err.message); return null; });
+  if (!role) { return interaction.followUp({ content: '❌ Failed to create FG role — check Manage Roles permission.', flags: MessageFlags.Ephemeral }); }
+
+  // Assign FG role to all members
+  const addedIds = [];
+  for (const memberId of (answers.memberIds || [])) {
+    const member = await guild.members.fetch(memberId).catch(() => null);
+    if (member) { await member.roles.add(role).catch(() => null); addedIds.push(memberId); }
+  }
+
+  // Assign "Friend Group Owner" role to the named owner
+  if (answers.ownerId) {
+    let fgOwnerRole = cfg.fgOwnerRoleId ? guild.roles.cache.get(cfg.fgOwnerRoleId) : null;
+    if (!fgOwnerRole) {
+      fgOwnerRole = await guild.roles.create({ name: 'Friend Group Owner', reason: 'Auto-created by FG system' }).catch(() => null);
+      if (fgOwnerRole) { cfg.fgOwnerRoleId = fgOwnerRole.id; saveDb(); }
+    }
+    if (fgOwnerRole) {
+      const owner = await guild.members.fetch(answers.ownerId).catch(() => null);
+      if (owner) await owner.roles.add(fgOwnerRole).catch(() => null);
+    }
+  }
+
+  // Create locked VC
+  const vc = await guild.channels.create({
+    name:   `${answers.name}'s vc`,
+    type:   ChannelType.GuildVoice,
+    parent: cfg.vcCategoryId || null,
+    permissionOverwrites: fgVcPerms(guild, role.id),
+    reason: `FG "${answers.name}" approved`,
+  }).catch(err => { console.error('[FG] vc create:', err.message); return null; });
+
+  // Save friend group
+  const data = getGuildData(guild.id);
+  if (!data.friendGroups) data.friendGroups = {};
+  data.friendGroups[fgId] = {
+    id: fgId, name: answers.name, roleId: role.id, vcId: vc?.id || null,
+    ownerId: answers.ownerId, memberIds: addedIds, color: answers.color,
+    paid: answers.paid, active: answers.active, source: 'application',
+    applicantId: app.applicantId, warnedAt: null, createdAt: Date.now(),
+  };
+  delete data.fgPendingApps[app.id];
+  saveDb();
+
+  // Update review embed
+  await interaction.message.edit({
+    embeds:     [buildFgReviewEmbed(answers, app.applicantId).setColor(0x57f287).setTitle('✅ Friend Group Application — APPROVED').setDescription(`Approved by <@${interaction.user.id}>`)],
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('fg_noop').setLabel('Approved').setStyle(ButtonStyle.Success).setDisabled(true).setEmoji('✅'))],
+    allowedMentions: { parse: [] },
+  }).catch(() => null);
+
+  // DM applicant
+  const applicant = await guild.members.fetch(app.applicantId).catch(() => null);
+  if (applicant) await applicant.user.send({ embeds: [new EmbedBuilder().setColor(0x57f287)
+    .setTitle('✅ Friend Group Approved!')
+    .setDescription(`Your application for **${answers.name}** has been **approved**!\n\nThe role and voice channel have been created. Welcome to the family! 🎉`)
+    .setTimestamp()] }).catch(() => null);
+
+  // DM owner (if different from applicant)
+  if (answers.ownerId && answers.ownerId !== app.applicantId) {
+    const owner = await guild.members.fetch(answers.ownerId).catch(() => null);
+    if (owner) await owner.user.send({ embeds: [new EmbedBuilder().setColor(0x57f287)
+      .setTitle("👑 You're a Friend Group Owner!")
+      .setDescription([
+        `You've been named the owner of **${answers.name}**!`,
+        '',
+        '**Your management commands:**',
+        `\`*fg rename <name>\` — Rename your group`,
+        `\`*fg color <hex>\`   — Change role color`,
+        `\`*fg icon <url>\`    — Change role icon`,
+        `\`*fg add @user ...\` — Add members`,
+        `\`*fg kick @user\`    — Remove a member`,
+        `\`*fg info\`          — View group stats`,
+      ].join('\n'))
+      .setTimestamp()] }).catch(() => null);
+  }
+
+  await interaction.followUp({ content: `✅ **${answers.name}** approved — role and VC created!`, flags: MessageFlags.Ephemeral }).catch(() => null);
+}
+
+// ── Denial ───────────────────────────────────────────────────────────────────
+async function denyFgApplication(interaction, app) {
+  const { guild } = interaction;
+  const { answers } = app;
+  await interaction.deferUpdate();
+
+  await interaction.message.edit({
+    embeds:     [buildFgReviewEmbed(answers, app.applicantId).setColor(0xed4245).setTitle('❌ Friend Group Application — DENIED').setDescription(`Denied by <@${interaction.user.id}>`)],
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('fg_noop').setLabel('Denied').setStyle(ButtonStyle.Danger).setDisabled(true).setEmoji('❌'))],
+    allowedMentions: { parse: [] },
+  }).catch(() => null);
+
+  const applicant = await guild.members.fetch(app.applicantId).catch(() => null);
+  if (applicant) await applicant.user.send({ embeds: [new EmbedBuilder().setColor(0xed4245)
+    .setTitle('❌ Friend Group Denied')
+    .setDescription(`Your application for **${answers.name}** was **denied**.\n\nMake adjustments and feel free to reapply. If you have questions, contact a staff member.`)
+    .setTimestamp()] }).catch(() => null);
+
+  const data = getGuildData(guild.id);
+  delete data.fgPendingApps[app.id];
+  saveDb();
+
+  await interaction.followUp({ content: `❌ **${answers.name}** application denied.`, flags: MessageFlags.Ephemeral }).catch(() => null);
+}
+
+// ── Lifecycle ────────────────────────────────────────────────────────────────
+async function deleteFriendGroup(guild, fgIdOrKey, reason = 'admin') {
+  const data   = getGuildData(guild.id);
+  const fgKey  = Object.keys(data.friendGroups || {})
+    .find(k => k === fgIdOrKey || data.friendGroups[k]?.id === fgIdOrKey);
+  if (!fgKey) return false;
+  const fg = data.friendGroups[fgKey];
+
+  const role = fg.roleId ? guild.roles.cache.get(fg.roleId) : null;
+  if (role) await role.delete(`FG deletion — ${reason}`).catch(() => null);
+  const vc = fg.vcId ? guild.channels.cache.get(fg.vcId) : null;
+  if (vc)   await vc.delete(`FG deletion — ${reason}`).catch(() => null);
+
+  if (!data.deletedFriendGroups) data.deletedFriendGroups = {};
+  data.deletedFriendGroups[fg.id || fgKey] = { ...fg, deletedAt: Date.now(), deletionReason: reason };
+  delete data.friendGroups[fgKey];
+  saveDb();
+  console.log(`[FG] Deleted "${fg.name}" (${fg.id || fgKey}) — reason: ${reason}`);
+  return true;
+}
+
+async function restoreFriendGroup(guild, fgId) {
+  const data = getGuildData(guild.id);
+  const snap = (data.deletedFriendGroups || {})[fgId];
+  if (!snap) return null;
+
+  const cfg   = getFgConfig(guild.id);
+  const color = snap.color ? Number.parseInt(snap.color.replace('#', ''), 16) : 0x5865f2;
+
+  const role = await guild.roles.create({ name: snap.name, color, reason: `FG "${snap.name}" restored` }).catch(() => null);
+  if (!role) return false;
+
+  const addedBack = [], notFound = [];
+  for (const id of (snap.memberIds || [])) {
+    const member = await guild.members.fetch(id).catch(() => null);
+    if (member) { await member.roles.add(role).catch(() => null); addedBack.push(id); }
+    else notFound.push(id);
+  }
+
+  if (snap.ownerId && cfg.fgOwnerRoleId) {
+    const ownerRole = guild.roles.cache.get(cfg.fgOwnerRoleId);
+    const owner     = await guild.members.fetch(snap.ownerId).catch(() => null);
+    if (ownerRole && owner) await owner.roles.add(ownerRole).catch(() => null);
+  }
+
+  const vc = await guild.channels.create({
+    name:   `${snap.name}'s vc`,
+    type:   ChannelType.GuildVoice,
+    parent: cfg.vcCategoryId || null,
+    permissionOverwrites: fgVcPerms(guild, role.id),
+    reason: `FG "${snap.name}" restored`,
+  }).catch(() => null);
+
+  const restored = { ...snap, roleId: role.id, vcId: vc?.id || null, memberIds: addedBack, warnedAt: null, deletedAt: null, deletionReason: null, restoredAt: Date.now() };
+  if (!data.friendGroups) data.friendGroups = {};
+  data.friendGroups[fgId] = restored;
+  delete data.deletedFriendGroups[fgId];
+  saveDb();
+  return { restored, notFound };
+}
+
+// Runs every 60s inside tickVcTracking — warns/deletes under-staffed FGs
+async function checkFgMemberCounts() {
+  for (const guild of client.guilds.cache.values()) {
+    const data = getGuildData(guild.id);
+    for (const [fgKey, fg] of Object.entries(data.friendGroups || {})) {
+      const count = (fg.memberIds || []).length;
+      if (count >= FG_MIN_MEMBERS) {
+        if (fg.warnedAt) { fg.warnedAt = null; saveDb(); }
+        continue;
+      }
+      if (!fg.warnedAt) {
+        fg.warnedAt = Date.now(); saveDb();
+        if (fg.ownerId) {
+          const owner = await guild.members.fetch(fg.ownerId).catch(() => null);
+          if (owner) await owner.user.send({ embeds: [new EmbedBuilder().setColor(0xffa500)
+            .setTitle('⚠️ Friend Group — Low Member Count')
+            .setDescription(`**${fg.name}** has **${count}** member${count === 1 ? '' : 's'}, below the required ${FG_MIN_MEMBERS}.\n\n> You have **24 hours** to bring it back to ${FG_MIN_MEMBERS}+ or the group will be **automatically deleted**.`)
+            .setFooter({ text: `ID: ${fg.id || fgKey}` })
+            .setTimestamp()] }).catch(() => null);
+        }
+      } else if (Date.now() - fg.warnedAt >= FG_WARNING_DURATION_MS) {
+        if (fg.ownerId) {
+          const owner = await guild.members.fetch(fg.ownerId).catch(() => null);
+          if (owner) await owner.user.send({ embeds: [new EmbedBuilder().setColor(0xed4245)
+            .setTitle('❌ Friend Group Deleted')
+            .setDescription(`**${fg.name}** was **automatically deleted** after 24 hours below the minimum member count.\n\nContact an admin to restore it.`)
+            .setTimestamp()] }).catch(() => null);
+        }
+        await deleteFriendGroup(guild, fg.id || fgKey, 'member_count');
+      }
+    }
+  }
+}
+
+// ── Owner management (*fg rename/color/icon/add/kick/info) ───────────────────
+async function handleFgOwnerCommand(message, sub, args) {
+  const data  = getGuildData(message.guild.id);
+  const fgKey = Object.keys(data.friendGroups || {}).find(k => data.friendGroups[k]?.ownerId === message.author.id);
+  if (!fgKey) return message.reply({ embeds: [simpleEmbed(0xed4245, "You don't currently own a friend group.")] });
+  const fg = data.friendGroups[fgKey];
+
+  if (sub === 'rename') {
+    const newName = args.join(' ').trim();
+    if (!newName || newName.length > 50) return replySyntax(message, `${PREFIX}fg rename <new name>`);
+    const clash = findFriendGroup(message.guild.id, newName);
+    if (clash && clash.key !== fgKey) return message.reply({ embeds: [simpleEmbed(0xed4245, `❌ A friend group named **${newName}** already exists.`)] });
+    const role = fg.roleId ? message.guild.roles.cache.get(fg.roleId) : null;
+    const vc   = fg.vcId   ? message.guild.channels.cache.get(fg.vcId)  : null;
+    if (role) await role.setName(newName).catch(() => null);
+    if (vc)   await vc.setName(`${newName}'s vc`).catch(() => null);
+    const oldName = fg.name;
+    fg.name = newName;
+    // If key was name-based (admin-created — key doesn't start with 'fg_'), rename the key
+    if (!fgKey.startsWith('fg_')) { data.friendGroups[newName] = fg; delete data.friendGroups[fgKey]; }
+    saveDb();
+    return message.reply({ embeds: [new EmbedBuilder().setColor(0x57f287).setTitle('✅ Friend Group Renamed')
+      .setDescription(`**${oldName}** → **${newName}**\nRole and VC names synced automatically.`).setTimestamp()] });
+  }
+
+  if (sub === 'color') {
+    const hex = (args[0] || '').replace('#', '').trim();
+    if (!/^[0-9a-fA-F]{6}$/.test(hex)) return replySyntax(message, `${PREFIX}fg color <hex>`, 'e.g. `*fg color FF69B4`');
+    const role = fg.roleId ? message.guild.roles.cache.get(fg.roleId) : null;
+    if (role) await role.setColor(Number.parseInt(hex, 16)).catch(() => null);
+    fg.color = `#${hex.toUpperCase()}`; saveDb();
+    return message.reply({ embeds: [new EmbedBuilder().setColor(Number.parseInt(hex, 16)).setDescription(`✅ Role color updated to **#${hex.toUpperCase()}**.`).setTimestamp()] });
+  }
+
+  if (sub === 'icon') {
+    const iconUrl = (args[0] || '').trim();
+    if (!iconUrl) return replySyntax(message, `${PREFIX}fg icon <url or emoji>`);
+    const role = fg.roleId ? message.guild.roles.cache.get(fg.roleId) : null;
+    if (!role) return message.reply({ embeds: [simpleEmbed(0xed4245, '❌ FG role not found.')] });
+    try {
+      await role.setIcon(iconUrl);
+      return message.reply({ embeds: [simpleEmbed(0x57f287, '✅ Role icon updated.')] });
+    } catch (err) {
+      return message.reply({ embeds: [simpleEmbed(0xed4245, `❌ Failed: ${err.message}\n*(Role icons require Server Boost Level 2.)*`)] });
+    }
+  }
+
+  if (sub === 'add') {
+    const ids = parseUserIdsFromText(args.join(' '));
+    if (!ids.length) return replySyntax(message, `${PREFIX}fg add @user1 @user2 ...`);
+    const role = fg.roleId ? message.guild.roles.cache.get(fg.roleId) : null;
+    const { resolved, failed: unresolved } = await resolveMembersFromIds(message.guild, ids);
+    const added = [], already = [], failed = unresolved.map(id => `\`${id}\``);
+    for (const member of resolved) {
+      if (member.user.bot) continue;
+      if ((fg.memberIds || []).includes(member.id)) { already.push(`<@${member.id}>`); continue; }
+      if (role) await member.roles.add(role).catch(() => null);
+      if (!fg.memberIds) fg.memberIds = [];
+      fg.memberIds.push(member.id);
+      added.push(`<@${member.id}>`);
+    }
+    saveDb();
+    const lines = [added.length ? `✅ Added: ${added.join(', ')}` : '', already.length ? `⚠️ Already in group: ${already.join(', ')}` : '', failed.length ? `❌ Not found: ${failed.join(', ')}` : ''].filter(Boolean);
+    return message.reply({ embeds: [new EmbedBuilder().setColor(0x57f287).setTitle(`👥 ${fg.name} — Members Added`).setDescription(lines.join('\n') || 'No changes.').setFooter({ text: `${(fg.memberIds || []).length} member(s)` }).setTimestamp()], allowedMentions: { parse: [] } });
+  }
+
+  if (sub === 'kick') {
+    const ids = parseUserIdsFromText(args.join(' '));
+    if (!ids.length) return replySyntax(message, `${PREFIX}fg kick @user`);
+    const role = fg.roleId ? message.guild.roles.cache.get(fg.roleId) : null;
+    const removed = [], notIn = [];
+    for (const id of ids) {
+      if (!(fg.memberIds || []).includes(id)) { notIn.push(`<@${id}>`); continue; }
+      const member = await message.guild.members.fetch(id).catch(() => null);
+      if (member && role) await member.roles.remove(role).catch(() => null);
+      fg.memberIds = (fg.memberIds || []).filter(m => m !== id);
+      removed.push(`<@${id}>`);
+    }
+    let warningLine = '';
+    if ((fg.memberIds || []).length < FG_MIN_MEMBERS && !fg.warnedAt) {
+      fg.warnedAt = Date.now();
+      warningLine = `\n\n⚠️ **Warning:** Your group now has **${fg.memberIds.length}** member(s) — below ${FG_MIN_MEMBERS}. Add more within **24 hours** or the group will be deleted.`;
+    }
+    saveDb();
+    const lines = [removed.length ? `✅ Removed: ${removed.join(', ')}` : '', notIn.length ? `⚠️ Not in group: ${notIn.join(', ')}` : ''].filter(Boolean);
+    return message.reply({ embeds: [new EmbedBuilder().setColor(0xed4245).setTitle(`👥 ${fg.name} — Member Removed`).setDescription((lines.join('\n') || 'No changes.') + warningLine).setFooter({ text: `${(fg.memberIds || []).length} member(s) remaining` }).setTimestamp()], allowedMentions: { parse: [] } });
+  }
+
+  if (sub === 'info') {
+    return message.reply({
+      embeds:     [buildFriendGroupStatsEmbed(message.guild.id, message.guild, fg)],
+      components: buildFriendGroupRefreshRow(fg.id || fgKey),
+      allowedMentions: { parse: [] },
+    });
+  }
+  return message.reply({ embeds: [simpleEmbed(0x7b48cc, `Unknown owner subcommand. Try \`${PREFIX}fg\` for a list.`)] });
+}
+
+// ── Admin setup/restore commands ─────────────────────────────────────────────
+async function handleFgAdminCommand(message, sub, args) {
+  if (!hasManagerPerm(message.member)) return message.reply({ embeds: [simpleEmbed(0xed4245, '❌ You need **Manage Server** for this command.')] });
+  const cfg  = getFgConfig(message.guild.id);
+  const data = getGuildData(message.guild.id);
+
+  if (sub === 'setup') {
+    const type   = (args.shift() || '').toLowerCase();
+    const target = message.mentions.channels.first() || (args[0] ? message.guild.channels.cache.get(args[0]) : null);
+    if (type === 'tickets') {
+      if (!target) return replySyntax(message, `${PREFIX}fg setup tickets #category`);
+      cfg.ticketCategoryId = target.id; saveDb();
+      return message.reply({ embeds: [simpleEmbed(0x57f287, `✅ Ticket category set to **${target.name}**.`)] });
+    }
+    if (type === 'review') {
+      if (!target?.isTextBased()) return replySyntax(message, `${PREFIX}fg setup review #channel`);
+      cfg.reviewChannelId = target.id; saveDb();
+      return message.reply({ embeds: [simpleEmbed(0x57f287, `✅ Review channel set to ${target}.`)] });
+    }
+    if (type === 'vcs') {
+      if (!target) return replySyntax(message, `${PREFIX}fg setup vcs #category`);
+      cfg.vcCategoryId = target.id; saveDb();
+      return message.reply({ embeds: [simpleEmbed(0x57f287, `✅ VC category set to **${target.name}**.`)] });
+    }
+    return message.reply({ embeds: [new EmbedBuilder().setColor(0x7b48cc).setTitle('⚙️ Friend Group Setup')
+      .setDescription([`\`${PREFIX}fg setup tickets #category\``,`\`${PREFIX}fg setup review #channel\``,`\`${PREFIX}fg setup vcs #category\``].join('\n'))
+      .addFields(
+        { name: 'Ticket Category', value: cfg.ticketCategoryId ? `<#${cfg.ticketCategoryId}>` : '*(not set)*', inline: true },
+        { name: 'Review Channel',  value: cfg.reviewChannelId  ? `<#${cfg.reviewChannelId}>`  : '*(not set)*', inline: true },
+        { name: 'VC Category',     value: cfg.vcCategoryId     ? `<#${cfg.vcCategoryId}>`     : '*(not set)*', inline: true },
+      ).setTimestamp()] });
+  }
+
+  if (sub === 'restore') {
+    const fgId = (args[0] || '').trim();
+    if (!fgId) return replySyntax(message, `${PREFIX}fg restore <id>`, `Use \`${PREFIX}fg deleted\` to find IDs.`);
+    const snap = (data.deletedFriendGroups || {})[fgId];
+    if (!snap) return message.reply({ embeds: [simpleEmbed(0xed4245, `❌ No deleted friend group with ID \`${fgId}\`.`)] });
+    const working = await message.reply({ embeds: [simpleEmbed(0x7b48cc, `⏳ Restoring **${snap.name}**...`)] });
+    const result  = await restoreFriendGroup(message.guild, fgId);
+    if (!result)  return working.edit({ embeds: [simpleEmbed(0xed4245, '❌ Restore failed — check my permissions.')] });
+    const { restored, notFound } = result;
+    return working.edit({ embeds: [new EmbedBuilder().setColor(0x57f287).setTitle(`✅ Restored — ${restored.name}`)
+      .setDescription([`Members restored: **${restored.memberIds.length}**`, notFound.length ? `Could not add (left server): ${notFound.map(id => `\`${id}\``).join(', ')}` : ''].filter(Boolean).join('\n'))
+      .addFields(
+        { name: 'Role',  value: `<@&${restored.roleId}>`,                        inline: true },
+        { name: 'VC',    value: restored.vcId ? `<#${restored.vcId}>` : '*(failed)*', inline: true },
+        { name: 'FG ID', value: `\`${fgId}\``,                                  inline: true },
+      ).setTimestamp()], allowedMentions: { parse: [] } });
+  }
+
+  if (sub === 'deleted') {
+    const deleted = Object.values(data.deletedFriendGroups || {});
+    if (!deleted.length) return message.reply({ embeds: [simpleEmbed(0x888888, 'No recently deleted friend groups on record.')] });
+    const lines = deleted.map((d, i) => {
+      const ts = `<t:${Math.floor((d.deletedAt || 0) / 1000)}:R>`;
+      return `**${i + 1}.** **${d.name}** — ${ts} *(${d.deletionReason || 'unknown'})*\n> ID: \`${d.id || '—'}\` ꔷ ${(d.memberIds || []).length} members`;
+    });
+    return message.reply({ embeds: [new EmbedBuilder().setColor(0xed4245).setTitle('🗑️ Recently Deleted Friend Groups').setDescription(lines.join('\n\n')).setFooter({ text: `*fg restore <id> to restore` }).setTimestamp()] });
+  }
+
+  return message.reply({ embeds: [simpleEmbed(0x7b48cc, `Unknown admin subcommand. Try \`${PREFIX}fg setup\`.`)] });
+}
+
+// ── Main dispatcher ──────────────────────────────────────────────────────────
+async function handleFgCommand(message, args) {
+  const sub = (args.shift() || 'help').toLowerCase();
+  if (sub === 'start')                                        return startFgApplication(message);
+  if (['setup', 'restore', 'deleted'].includes(sub))         return handleFgAdminCommand(message, sub, args);
+  if (['rename', 'color', 'icon', 'add', 'kick', 'info'].includes(sub)) return handleFgOwnerCommand(message, sub, args);
+  return message.reply({ embeds: [new EmbedBuilder().setColor(0x7b48cc).setTitle('👥 Friend Group Commands')
+    .setDescription([
+      '**Application**',
+      `> \`${PREFIX}fg start\` — Open a friend group application`,
+      '',
+      '**Owner Commands** *(FG owners only)*',
+      `> \`${PREFIX}fg rename <name>\` — Rename your group + sync role & VC`,
+      `> \`${PREFIX}fg color <hex>\`   — Change role color`,
+      `> \`${PREFIX}fg icon <url>\`    — Change role icon *(Boost Level 2)*`,
+      `> \`${PREFIX}fg add @user ...\` — Add members`,
+      `> \`${PREFIX}fg kick @user\`    — Remove a member`,
+      `> \`${PREFIX}fg info\`          — View group stats`,
+      '',
+      '**Admin** *(Manage Server)*',
+      `> \`${PREFIX}fg setup\`         — Configure ticket/review/VC settings`,
+      `> \`${PREFIX}fg deleted\`       — View recently deleted groups`,
+      `> \`${PREFIX}fg restore <id>\`  — Restore a deleted group`,
+    ].join('\n')).setTimestamp()] });
 }
 
 // =========================
@@ -2047,7 +2781,7 @@ async function handleLeaveCommand(message, args) {
 
   collector.on('collect', async (interaction) => {
     if (interaction.user.id !== message.author.id)
-      return interaction.reply({ content: 'Only the bot owner can confirm this.', ephemeral: true });
+      return interaction.reply({ content: 'Only the bot owner can confirm this.', flags: MessageFlags.Ephemeral });
 
     if (interaction.customId === `${confirmId}:no`) {
       collector.stop('cancelled');
@@ -2773,7 +3507,7 @@ async function startInteractiveBlackjack(message, command, args) {
   const collector = gm.createMessageComponentCollector({ time: 90_000 });
   collector.on('collect', async (interaction) => {
     if (!interaction.customId.startsWith(`${gameId}:`)) return;
-    if (interaction.user.id !== game.userId) return interaction.reply({ content: 'This is not your game.', ephemeral: true });
+    if (interaction.user.id !== game.userId) return interaction.reply({ content: 'This is not your game.', flags: MessageFlags.Ephemeral });
     const action = interaction.customId.split(':')[1];
     if (action === 'hit') {
       game.player.push(drawCard());
@@ -2854,7 +3588,7 @@ async function startTicTacToe(message, command, args) {
   const confirmCollector = challengeMsg.createMessageComponentCollector({ time: 60_000 });
   confirmCollector.on('collect', async (interaction) => {
     if (!interaction.customId.startsWith(`${confirmId}:`)) return;
-    if (interaction.user.id !== target.id) return interaction.reply({ content: 'Only the challenged user can respond.', ephemeral: true });
+    if (interaction.user.id !== target.id) return interaction.reply({ content: 'Only the challenged user can respond.', flags: MessageFlags.Ephemeral });
     const action = interaction.customId.split(':')[1];
     if (action === 'deny') { confirmCollector.stop('denied'); await interaction.update({ content: `<@${message.author.id}> your game got denied by <@${target.id}>.`, embeds: [], components: [], allowedMentions: { users: [message.author.id, target.id] } }); return; }
     const fc = getEcoUser(message.guild.id, message.author.id), ft = getEcoUser(message.guild.id, target.id);
@@ -2873,9 +3607,9 @@ async function startTicTacToe(message, command, args) {
     gameCollector.on('collect', async (mi) => {
       if (!mi.customId.startsWith(`${gameId}:move:`)) return;
       const currentId = game.turn === 'X' ? game.xId : game.oId;
-      if (mi.user.id !== currentId) return mi.reply({ content: 'It is not your turn.', ephemeral: true });
+      if (mi.user.id !== currentId) return mi.reply({ content: 'It is not your turn.', flags: MessageFlags.Ephemeral });
       const index = Number(mi.customId.split(':')[2]);
-      if (!Number.isInteger(index) || index < 0 || index > 8 || game.board[index]) return mi.reply({ content: 'That spot is not available.', ephemeral: true });
+      if (!Number.isInteger(index) || index < 0 || index > 8 || game.board[index]) return mi.reply({ content: 'That spot is not available.', flags: MessageFlags.Ephemeral });
       game.board[index] = game.turn;
       const winner = tttWinner(game.board);
       if (winner) {
@@ -3370,10 +4104,11 @@ async function handleCommand(message) {
       `> \`${PREFIX}vcm\` — View milestones · \`${PREFIX}vcm add @Role 24h\` — Add milestone`,
       `> \`${PREFIX}vcm check [@user]\` — VC time · \`${PREFIX}vcm lb\` — Leaderboard`,
       '',
-      '**👥 Friend Groups** *(slash command)*',
-      `> \`/friendgroup create name:Crew @user1 @user2\` — Create a group`,
-      `> \`/friendgroup stats name:Crew\` — Live message + VC stats`,
-      `> \`/friendgroup list\` — View all groups`,
+      '**👥 Friend Groups**',
+      `> \`${PREFIX}fg start\` — Open a friend group application`,
+      `> \`${PREFIX}fg rename|color|icon|add|kick|info\` — Owner management`,
+      `> \`${PREFIX}fg setup|restore|deleted\` — Admin tools`,
+      `> \`/friendgroup create|stats|list|add|remove\` — Admin slash commands`,
       '',
       '**🎉 Giveaways** *(slash command)*',
       `> \`/giveaway create\` — Start a giveaway with optional requirements`,
@@ -3429,7 +4164,8 @@ async function handleCommand(message) {
     if (!data.uwuTargets.length) return message.reply('No users are currently uwuified.');
     return message.reply({ embeds: [new EmbedBuilder().setTitle('UwUified Users').setDescription(data.uwuTargets.map((id,i)=>`${i+1}. <@${id}>`).join('\n'))], allowedMentions: { parse: [] } });
   }
-  if (command === 'purge' || command === 'clear') {
+  if (command === 'fg')                           return handleFgCommand(message, args);
+    if (command === 'purge' || command === 'clear') {
     if (!message.member.permissions.has(PermissionsBitField.Flags.ManageMessages) && !message.member.permissions.has(PermissionsBitField.Flags.Administrator))
       return message.reply('You need Manage Messages or Administrator.');
     const amount = Number.parseInt(args[0], 10);
@@ -3556,7 +4292,7 @@ client.on('presenceUpdate', async (oldPresence, newPresence) => {
 client.on('interactionCreate', async (interaction) => {
   try {
     if (!interaction.guild) {
-      if (interaction.isRepliable()) await interaction.reply({ content: 'This can only be used in a server.', ephemeral: true }).catch(() => null);
+      if (interaction.isRepliable()) await interaction.reply({ content: 'This can only be used in a server.', flags: MessageFlags.Ephemeral }).catch(() => null);
       return;
     }
 
@@ -3566,12 +4302,12 @@ client.on('interactionCreate', async (interaction) => {
         const focused  = interaction.options.getFocused(true);
         if (focused.name === 'name') {
           const data    = getGuildData(interaction.guild.id);
-          const groups  = Object.keys(data.friendGroups || {});
+          const groups  = Object.values(data.friendGroups || {});
           const val     = focused.value.toLowerCase();
           const choices = groups
-            .filter(k => k.toLowerCase().includes(val))
+            .filter(g => (g.name || '').toLowerCase().includes(val))
             .slice(0, 25)
-            .map(k => ({ name: k, value: k }));
+            .map(g => ({ name: g.name || g.id, value: g.name || g.id }));
           await interaction.respond(choices).catch(() => null);
         }
       }
@@ -3603,7 +4339,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.commandName === 'statusrole') {
       if (!interaction.member.permissions.has(PermissionsBitField.Flags.ManageGuild))
-        return interaction.reply({ content: 'You need **Manage Server** to use this command.', ephemeral: true });
+        return interaction.reply({ content: 'You need **Manage Server** to use this command.', flags: MessageFlags.Ephemeral });
       await handleStatusRoleInteraction(interaction);
     }
     if (interaction.commandName === 'giveaway') {
@@ -3614,7 +4350,7 @@ client.on('interactionCreate', async (interaction) => {
     }
   } catch (err) {
     console.error('interactionCreate error:', err);
-    const reply = { content: 'Something went wrong — please try again.', ephemeral: true };
+    const reply = { content: 'Something went wrong — please try again.', flags: MessageFlags.Ephemeral };
     if (interaction.deferred) await interaction.editReply(reply).catch(() => null);
     else if (!interaction.replied) await interaction.reply(reply).catch(() => null);
   }
