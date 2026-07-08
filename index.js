@@ -1681,9 +1681,9 @@ async function handleFriendGroupInteraction(interaction) {
       });
     }
     const lines = groups.map((g, i) => {
-      const role    = g.roleId ? interaction.guild.roles.cache.get(g.roleId) : null;
-      const roleTxt = role ? ` ꔷ <@&${g.roleId}>` : '';
-      return `**${i + 1}.** **${g.name}**${roleTxt} ꔷ **${(g.memberIds || []).length}** member(s)`;
+      const roleTxt = g.roleId ? ` ꔷ <@&${g.roleId}>` : '';
+      const src     = g.source === 'application' ? ' *(applied)*' : '';
+      return `**${i + 1}.** **${g.name}**${roleTxt} ꔷ **${(g.memberIds || []).length}** member(s)${src}`;
     });
     return interaction.reply({
       embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('👥 Friend Groups')
@@ -1733,6 +1733,13 @@ async function handleFriendGroupInteraction(interaction) {
 
     if (!role) return interaction.editReply('❌ Failed to create the role — check I have Manage Roles permission.');
 
+    // Position under the FG anchor role if configured
+    const _createCfg = getFgConfig(interaction.guild.id);
+    if (_createCfg.fgRoleAnchorId) {
+      const _createAnchor = interaction.guild.roles.cache.get(_createCfg.fgRoleAnchorId);
+      if (_createAnchor) await role.setPosition(_createAnchor.position - 1).catch(() => null);
+    }
+
     const { resolved, failed } = await resolveMembersFromIds(interaction.guild, userIds);
     const memberIds = [];
     const added     = [];
@@ -1781,7 +1788,6 @@ async function handleFriendGroupInteraction(interaction) {
     const found     = findFriendGroup(interaction.guild.id, name);
     if (!found) return interaction.reply({ content: `Group \`${name}\` not found.`, flags: MessageFlags.Ephemeral });
     const { key, group } = found;
-    const role      = group.roleId ? interaction.guild.roles.cache.get(group.roleId) : null;
     const membersIn = interaction.options.getString('members', true);
     const userIds   = parseUserIdsFromText(membersIn);
 
@@ -1790,6 +1796,7 @@ async function handleFriendGroupInteraction(interaction) {
 
     await interaction.deferReply();
 
+    const role = group.roleId ? await interaction.guild.roles.fetch(group.roleId).catch(() => null) : null;
     const { resolved, failed: unresolved } = await resolveMembersFromIds(interaction.guild, userIds);
     const added   = [];
     const already = [];
@@ -1804,6 +1811,11 @@ async function handleFriendGroupInteraction(interaction) {
         group.memberIds.push(member.id);
         added.push(`<@${member.id}>`);
       } catch { failed.push(member.id); }
+    }
+
+    // Clear below-5 warning if the group has recovered
+    if ((group.memberIds || []).length >= FG_MIN_MEMBERS && group.warnedAt) {
+      group.warnedAt = null;
     }
     saveDb();
 
@@ -1828,7 +1840,6 @@ async function handleFriendGroupInteraction(interaction) {
     const found     = findFriendGroup(interaction.guild.id, name);
     if (!found) return interaction.reply({ content: `Group \`${name}\` not found.`, flags: MessageFlags.Ephemeral });
     const { key, group } = found;
-    const role      = group.roleId ? interaction.guild.roles.cache.get(group.roleId) : null;
     const membersIn = interaction.options.getString('members', true);
     const userIds   = parseUserIdsFromText(membersIn);
 
@@ -1837,6 +1848,7 @@ async function handleFriendGroupInteraction(interaction) {
 
     await interaction.deferReply();
 
+    const role    = group.roleId ? await interaction.guild.roles.fetch(group.roleId).catch(() => null) : null;
     const removed = [];
     const notIn   = [];
 
@@ -1847,6 +1859,13 @@ async function handleFriendGroupInteraction(interaction) {
       group.memberIds = (group.memberIds || []).filter(id => id !== userId);
       removed.push(`<@${userId}>`);
     }
+
+    // Fire below-5 warning if needed (mirrors *fg kick behaviour)
+    let warningLine = '';
+    if ((group.memberIds || []).length < FG_MIN_MEMBERS && !group.warnedAt) {
+      group.warnedAt = Date.now();
+      warningLine = `\n\n⚠️ **Warning:** This group now has **${group.memberIds.length}** member(s) — below the minimum of ${FG_MIN_MEMBERS}. The group owner has 24 hours to resolve this or the group will be automatically deleted.`;
+    }
     saveDb();
 
     const lines = [
@@ -1856,7 +1875,7 @@ async function handleFriendGroupInteraction(interaction) {
 
     return interaction.editReply({
       embeds: [new EmbedBuilder().setColor(0xed4245).setTitle(`👥 ${group.name} — Members Removed`)
-        .setDescription(lines.join('\n') || 'No changes made.')
+        .setDescription((lines.join('\n') || 'No changes made.') + warningLine)
         .setFooter({ text: `${(group.memberIds || []).length} member(s) remaining` })
         .setTimestamp()],
       allowedMentions: { parse: [] },
@@ -1872,15 +1891,16 @@ async function handleFriendGroupInteraction(interaction) {
 
     await interaction.deferReply();
 
-    const role = group.roleId ? interaction.guild.roles.cache.get(group.roleId) : null;
-    if (role) await role.delete(`Friend group "${group.name}" deleted by ${interaction.user.tag}`).catch(() => null);
-
-    delete data.friendGroups[key];
-    saveDb();
+    // Route through deleteFriendGroup() so the VC is removed,
+    // the deletion is logged to deletedFriendGroups, and restore works.
+    const ok = await deleteFriendGroup(interaction.guild, key, `Deleted by ${interaction.user.tag}`);
+    if (!ok) return interaction.editReply({ content: '❌ Failed to delete the friend group — check my permissions.' });
 
     return interaction.editReply({
       embeds: [new EmbedBuilder().setColor(0xed4245).setTitle('👥 Friend Group Deleted')
-        .setDescription(`**${group.name}** has been deleted${role ? ' and its role removed' : ''}.`)
+        .setDescription(`**${group.name}** has been deleted. Role and VC removed.
+
+> Logged in recently deleted — use \`*fg restore\` to undo.`)
         .setTimestamp()],
     });
   }
@@ -2345,10 +2365,11 @@ async function deleteFriendGroup(guild, fgIdOrKey, reason = 'admin') {
   if (!fgKey) return false;
   const fg = data.friendGroups[fgKey];
 
-  const role = fg.roleId ? guild.roles.cache.get(fg.roleId) : null;
-  if (role) await role.delete(`FG deletion — ${reason}`).catch(() => null);
-  const vc = fg.vcId ? guild.channels.cache.get(fg.vcId) : null;
-  if (vc)   await vc.delete(`FG deletion — ${reason}`).catch(() => null);
+  // Use fetch() not cache.get() — cache may be stale after a restart
+  const role = fg.roleId ? await guild.roles.fetch(fg.roleId).catch(() => null) : null;
+  if (role) await role.delete(`FG deletion — ${reason}`).catch(err => console.error('[FG] role delete error:', err.message));
+  const vc = fg.vcId ? await guild.channels.fetch(fg.vcId).catch(() => null) : null;
+  if (vc)   await vc.delete(`FG deletion — ${reason}`).catch(err => console.error('[FG] vc delete error:', err.message));
 
   if (!data.deletedFriendGroups) data.deletedFriendGroups = {};
   data.deletedFriendGroups[fg.id || fgKey] = { ...fg, deletedAt: Date.now(), deletionReason: reason };
