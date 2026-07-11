@@ -1623,15 +1623,41 @@ function buildFriendGroupStatsEmbed(guildId, guild, group) {
   const totalMessages = members.reduce((s, m) => s + m.messages, 0);
   const totalVcMs     = members.reduce((s, m) => s + m.vcMs, 0);
 
-  const memberLines = members.length > 0
+  // Build per-member lines then chunk them to stay under Discord's 1024-char field limit
+  const memberEntries = members.length > 0
     ? members.map((m, i) => {
         const live = vcSessions.has(`${guildId}:${m.id}`) ? ' 🔴' : '';
         return [
           `> **${i + 1}.** ${m.member ? `<@${m.id}>` : `\`${m.id}\``}${live}`,
           `> ‎ ‎ ‎ ‎ 💬 **${m.messages.toLocaleString('en-US')}** msgs  ꔷ  🎙️ **${formatDuration(m.vcMs)}** in VC`,
         ].join('\n');
-      }).join('\n\n')
-    : '*(no members)*';
+      })
+    : null;
+
+  // Split entries into chunks that each fit within 1024 chars
+  const memberChunks = (() => {
+    if (!memberEntries) return ['*(no members)*'];
+    const chunks = [];
+    let current  = '';
+    for (const entry of memberEntries) {
+      const sep = current ? '\n\n' : '';
+      if ((current + sep + entry).length > 1024) {
+        if (current) chunks.push(current);
+        current = entry;
+      } else {
+        current += sep + entry;
+      }
+    }
+    if (current) chunks.push(current);
+    return chunks;
+  })();
+
+  // First chunk gets the header; overflow chunks get a zero-width continuation header
+  const memberFields = memberChunks.map((chunk, i) => ({
+    name:   i === 0 ? '👤 Members — ranked by messages' : '\u200b',
+    value:  chunk,
+    inline: false,
+  }));
 
   return new EmbedBuilder()
     .setColor(color)
@@ -1646,11 +1672,7 @@ function buildFriendGroupStatsEmbed(guildId, guild, group) {
         ].join('\n'),
         inline: false,
       },
-      {
-        name:  '👤 Members — ranked by messages',
-        value: memberLines,
-        inline: false,
-      },
+      ...memberFields,
     )
     .setFooter({ text: `🔴 = currently in VC  ꔷ  ID: ${group.id || '—'}  ꔷ  🔄 to refresh` })
     .setTimestamp();
